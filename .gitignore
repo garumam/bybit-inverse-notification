@@ -1,0 +1,32 @@
+# Binários
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Banco de dados
+*.db
+*.db-shm
+*.db-wal
+
+# Go
+*.test
+*.out
+go.work
+# go.sum será gerado automaticamente
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+data/
+

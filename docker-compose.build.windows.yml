@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  builder:
+    build:
+      context: .
+      dockerfile: Dockerfile.build.windows
+    volumes:
+      # Montar o código fonte
+      - .:/app
+      # Montar a pasta bin para salvar os builds
+      - ./bin:/app/bin
+    working_dir: /app
+    # Não manter o container rodando após o build
+    command: /usr/local/bin/build-windows.sh
+

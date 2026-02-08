@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  bybit-notifier:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bybit-notifier
+    volumes:
+      - ./data:/app/data
+    environment:
+      - DATA_DIR=/app/data
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+    # Para desenvolvimento interativo, use: docker-compose run --rm bybit-notifier
+

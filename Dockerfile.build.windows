@@ -1,0 +1,43 @@
+FROM golang:1.21
+
+# Instalar dependências necessárias para CGO e cross-compilation para Windows
+RUN apt-get update && apt-get install -y \
+    gcc-mingw-w64 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Script para gerar build do Windows
+RUN echo '#!/bin/bash\n\
+set -e\n\
+echo "=== Gerando build para Windows ==="\n\
+echo ""\n\
+\n\
+# Criar diretório de saída\n\
+mkdir -p /app/bin\n\
+\n\
+# Baixar dependências\n\
+echo "Baixando dependências..."\n\
+cd /app\n\
+go mod download\n\
+go mod tidy\n\
+\n\
+echo ""\n\
+echo "Building for Windows..."\n\
+# Para Windows com CGO, precisamos do compilador MinGW\n\
+if CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC=x86_64-w64-mingw32-gcc go build -o /app/bin/bybit-notifier-windows.exe -ldflags="-s -w" . 2>/dev/null; then\n\
+    echo "✓ Build do Windows concluído com CGO (suporte completo ao SQLite)"\n\
+else\n\
+    echo "AVISO: Build do Windows com CGO falhou. Tentando sem CGO..."\n\
+    CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o /app/bin/bybit-notifier-windows.exe -ldflags="-s -w" .\n\
+    echo "AVISO: Build do Windows gerado sem CGO. Pode não funcionar corretamente com SQLite."\n\
+fi\n\
+\n\
+echo ""\n\
+echo "=== Build concluído! ==="\n\
+echo "Arquivo em /app/bin/:"\n\
+ls -lh /app/bin/bybit-notifier-windows.exe\n\
+' > /usr/local/bin/build-windows.sh && chmod +x /usr/local/bin/build-windows.sh
+
+CMD ["/usr/local/bin/build-windows.sh"]
+

@@ -1,0 +1,10 @@
+bin/
+*.db
+*.exe
+.git/
+.gitignore
+README.md
+EXEMPLO_USO.md
+data/
+go.sum
+
