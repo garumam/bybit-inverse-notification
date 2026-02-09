@@ -230,6 +230,10 @@ sudo systemctl status bybit-notifier
 **Para abrir o app e interagir com ele:**
 ```bash
 screen -r bybit
+
+ou -rd caso retorne a mensagem que já está attached
+
+screen -rd bybit
 ```
 
 **Para manter em background (desanexar do screen):**
