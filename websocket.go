@@ -389,6 +389,7 @@ func (wsm *WebSocketManager) runConnection(wsConn *WebSocketConnection) {
 	maxRetries := 999999 // Reconexão infinita
 	retryDelay := time.Second * 5
 	maxRetryDelay := time.Minute * 5
+	initialRetryDelay := retryDelay
 
 	logger, err := getLogger(wsConn.AccountID, wsConn.Account.Name)
 	if err != nil {
@@ -396,11 +397,38 @@ func (wsm *WebSocketManager) runConnection(wsConn *WebSocketConnection) {
 		fmt.Fprintf(os.Stderr, "ERRO: Não foi possível criar logger para conta %d: %v\n", wsConn.AccountID, err)
 	}
 
+	consecutiveFailures := 0
+	maxConsecutiveFailures := 10 // Após 10 falhas consecutivas, fazer limpeza forçada
+
 	for retry := 0; retry < maxRetries; retry++ {
 		select {
 		case <-wsConn.StopChan:
 			return
 		default:
+		}
+
+		// Limpar conexão antiga antes de tentar nova conexão
+		wsConn.mu.Lock()
+		if wsConn.Conn != nil {
+			// Fechar conexão antiga silenciosamente
+			wsConn.Conn.Close()
+			wsConn.Conn = nil
+		}
+		wsConn.mu.Unlock()
+
+		// Se houver muitas falhas consecutivas, fazer uma limpeza mais agressiva
+		if consecutiveFailures >= maxConsecutiveFailures {
+			if logger != nil {
+				logger.Log("⚠️ Muitas falhas consecutivas (%d), fazendo limpeza forçada e aguardando antes de reconectar...", consecutiveFailures)
+			}
+			// Resetar delay e aguardar mais tempo
+			retryDelay = initialRetryDelay
+			consecutiveFailures = 0
+			select {
+			case <-wsConn.StopChan:
+				return
+			case <-time.After(30 * time.Second):
+			}
 		}
 
 		if err := wsm.connectAndListen(wsConn); err != nil {
@@ -411,8 +439,9 @@ func (wsm *WebSocketManager) runConnection(wsConn *WebSocketConnection) {
 			default:
 			}
 
+			consecutiveFailures++
 			if logger != nil {
-				logger.Log("Erro na conexão WebSocket (tentativa %d): %v", retry+1, err)
+				logger.Log("Erro na conexão WebSocket (tentativa %d, falhas consecutivas: %d): %v", retry+1, consecutiveFailures, err)
 			}
 
 			// Exponential backoff com limite máximo
@@ -425,16 +454,20 @@ func (wsm *WebSocketManager) runConnection(wsConn *WebSocketConnection) {
 				}
 			}
 		} else {
+			// Conexão bem-sucedida - resetar contadores e delays
+			consecutiveFailures = 0
+			retryDelay = initialRetryDelay
+			
 			// Conexão fechada normalmente, verificar se deve reconectar
 			select {
 			case <-wsConn.StopChan:
 				return
 			default:
-				// Reconectar após um delay
+				// Reconectar após um delay curto
 				if logger != nil {
 					logger.Log("Conexão fechada, tentando reconectar...")
 				}
-				time.Sleep(retryDelay)
+				time.Sleep(initialRetryDelay)
 			}
 		}
 	}
@@ -481,10 +514,23 @@ func (wsm *WebSocketManager) connectAndListen(wsConn *WebSocketConnection) (err 
 	}
 
 	wsConn.mu.Lock()
+	// Fechar conexão antiga se existir
+	if wsConn.Conn != nil {
+		wsConn.Conn.Close()
+	}
 	wsConn.Conn = conn
 	wsConn.mu.Unlock()
 
-	defer conn.Close()
+	// Garantir que a conexão seja fechada ao sair
+	defer func() {
+		wsConn.mu.Lock()
+		if wsConn.Conn == conn {
+			wsConn.Conn.Close()
+			wsConn.Conn = nil
+		}
+		wsConn.mu.Unlock()
+		conn.Close()
+	}()
 
 	// Autenticar
 	if err := wsm.authenticate(conn, wsConn.Account); err != nil {
@@ -521,8 +567,14 @@ func (wsm *WebSocketManager) connectAndListen(wsConn *WebSocketConnection) (err 
 		return nil
 	})
 
+	// Criar um canal de stop específico para o pingLoop desta conexão
+	pingStopChan := make(chan struct{})
+	
 	// Iniciar ping em goroutine separada
-	go wsm.pingLoop(conn, wsConn.StopChan)
+	go wsm.pingLoop(conn, pingStopChan)
+	
+	// Garantir que o pingLoop seja parado quando sair desta função
+	defer close(pingStopChan)
 
 	// Ler mensagens
 	for {
@@ -540,10 +592,40 @@ func (wsm *WebSocketManager) connectAndListen(wsConn *WebSocketConnection) (err 
 				default:
 				}
 
+				// Verificar se é um erro de fechamento
+				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+					// Fechamento normal - retornar nil para reconectar
+					if logger != nil {
+						logger.Log("Conexão fechada normalmente pelo servidor")
+					}
+					return nil
+				}
+
+				// Para erros 1006 (abnormal closure) e outros erros inesperados,
+				// garantir que a conexão seja limpa antes de retornar
 				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+					if logger != nil {
+						logger.Log("Erro inesperado de fechamento: %v", err)
+					}
+					// Limpar conexão antes de retornar
+					wsConn.mu.Lock()
+					if wsConn.Conn == conn {
+						wsConn.Conn = nil
+					}
+					wsConn.mu.Unlock()
 					return fmt.Errorf("erro ao ler mensagem: %w", err)
 				}
+				
 				// Timeout ou erro de leitura, reconectar
+				if logger != nil {
+					logger.Log("Erro na leitura (timeout ou outro): %v", err)
+				}
+				// Limpar conexão antes de retornar
+				wsConn.mu.Lock()
+				if wsConn.Conn == conn {
+					wsConn.Conn = nil
+				}
+				wsConn.mu.Unlock()
 				return fmt.Errorf("erro na leitura: %w", err)
 			}
 
@@ -637,9 +719,17 @@ func (wsm *WebSocketManager) pingLoop(conn *websocket.Conn, stopChan chan struct
 		case <-stopChan:
 			return
 		case <-ticker.C:
+			// Verificar se o canal foi fechado antes de tentar escrever
+			select {
+			case <-stopChan:
+				return
+			default:
+			}
+			
 			conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				// Erro ao enviar ping, a conexão será detectada no loop principal
+				// Não fazer nada, apenas retornar para parar o loop
 				return
 			}
 		}

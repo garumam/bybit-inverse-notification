@@ -56,7 +56,6 @@ func main() {
 			wsManager.StopAll()
 			return
 		default:
-			fmt.Println("Opção inválida!")
 		}
 	}
 }
@@ -657,7 +656,6 @@ func handleViewLogs(manager *AccountManager, scanner *bufio.Scanner) {
 	case "2":
 		viewLogTail(account.ID, account.Name, scanner)
 	default:
-		fmt.Println("Opção inválida!")
 	}
 }
 
