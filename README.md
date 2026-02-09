@@ -157,6 +157,99 @@ chmod +x bin/bybit-notifier-linux
 
 **Nota:** O aplicativo criará automaticamente a pasta `data/` no diretório atual para armazenar o banco de dados SQLite e os logs.
 
+## Executando em Produção (Linux)
+
+Para executar o aplicativo como um serviço systemd em produção no Linux, siga os passos abaixo:
+
+### Pré-requisitos
+
+Instale o `screen` (necessário para executar o serviço em background):
+```bash
+sudo apt install screen
+```
+
+Para ver processos rodando no screen:
+```bash
+screen -ls
+```
+
+### Configuração do Serviço systemd
+
+1. **Criar o arquivo de serviço:**
+```bash
+sudo vi /etc/systemd/system/bybit-notifier.service
+```
+
+2. **Adicione o seguinte conteúdo no arquivo** (substitua `USERNAME` pelo seu usuário Linux e ajuste os caminhos conforme necessário):
+
+```ini
+[Unit]
+Description=Bybit Notifier Service
+After=network.target
+
+[Service]
+Type=forking
+User=USERNAME
+WorkingDirectory=/home/USERNAME/bybit_notifier
+ExecStart=/usr/bin/screen -dmS bybit /home/USERNAME/bybit_notifier/bybit-notifier-linux
+ExecStop=/usr/bin/screen -S bybit -X quit
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**Importante:** Ajuste os seguintes valores no arquivo acima:
+- `User=USERNAME` - Substitua pelo seu usuário Linux
+- `WorkingDirectory=/home/USERNAME/bybit_notifier` - Substitua `USERNAME` pelo seu usuário e ajuste o caminho onde o executável está localizado
+- `ExecStart=/home/USERNAME/bybit_notifier/bybit-notifier-linux` - Ajuste o caminho completo para o executável `bybit-notifier-linux`
+
+3. **Reinicie o daemon do systemd:**
+```bash
+sudo systemctl daemon-reload
+```
+
+4. **Habilitar para iniciar automaticamente no boot:**
+```bash
+sudo systemctl enable bybit-notifier
+```
+
+5. **Iniciar o serviço agora:**
+```bash
+sudo systemctl start bybit-notifier
+```
+
+6. **Verificar o status do serviço:**
+```bash
+sudo systemctl status bybit-notifier
+```
+
+### Gerenciamento do Serviço
+
+**Para abrir o app e interagir com ele:**
+```bash
+screen -r bybit
+```
+
+**Para manter em background (desanexar do screen):**
+- Pressione `Ctrl+A` e depois `D`
+
+**Outros comandos úteis:**
+```bash
+# Parar o serviço
+sudo systemctl stop bybit-notifier
+
+# Reiniciar o serviço
+sudo systemctl restart bybit-notifier
+
+# Ver logs do serviço
+sudo journalctl -u bybit-notifier -f
+
+# Desabilitar inicialização automática
+sudo systemctl disable bybit-notifier
+```
+
 ## Uso
 
 1. Execute o aplicativo
