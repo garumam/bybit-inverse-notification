@@ -889,7 +889,20 @@ func (wsm *WebSocketManager) handleOrderMessage(wsConn *WebSocketConnection, ord
 		}
 
 		// Processar abertura de ordem ou cancelamento
-		if orderData.OrderStatus == "New" || orderData.OrderStatus == "PartiallyFilled" || (orderData.OrderStatus == "Filled" && orderData.OrderType == "Market") {
+		// Verificar se é Limit executada rapidamente (até 3 segundos entre criação e atualização)
+		isLimitExecutedQuickly := false
+		if orderData.OrderType == "Limit" && (orderData.OrderStatus == "Filled" || orderData.OrderStatus == "PartiallyFilled") {
+			createdTime, err1 := strconv.ParseInt(orderData.CreatedTime, 10, 64)
+			updatedTime, err2 := strconv.ParseInt(orderData.UpdatedTime, 10, 64)
+			if err1 == nil && err2 == nil {
+				timeDiff := updatedTime - createdTime
+				if timeDiff >= 0 && timeDiff <= 3000 { // Diferença de até 3 segundos (3000ms)
+					isLimitExecutedQuickly = true
+				}
+			}
+		}
+		
+		if orderData.OrderStatus == "New" || (orderData.OrderType == "Market" && (orderData.OrderStatus == "Filled" || orderData.OrderStatus == "PartiallyFilled")) || isLimitExecutedQuickly {
 			wsm.addOrderToBuffer(wsConn.AccountID, orderData, wsConn)
 		} else if orderData.OrderStatus == "Cancelled" || (orderData.CancelType != "" && orderData.StopOrderType != "Stop" && orderData.OrderStatus != "Filled") {
 			// Excluir stops do processamento de cancelamento normal
@@ -1071,6 +1084,10 @@ func (wsm *WebSocketManager) processOrderBuffer(accountID int64, wsConn *WebSock
 		getDisplayPrice := func(order OrderData) string {
 			// Se for Market e tiver avgPrice, usar avgPrice
 			if order.OrderType == "Market" && order.AvgPrice != "" && order.AvgPrice != "0" {
+				return order.AvgPrice
+			}
+
+			if order.OrderType == "Limit" && order.AvgPrice != "" && order.AvgPrice != "0" && (order.OrderStatus == "Filled" || order.OrderStatus == "PartiallyFilled") {
 				return order.AvgPrice
 			}
 			// Caso contrário, usar Price
