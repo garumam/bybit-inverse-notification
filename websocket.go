@@ -904,7 +904,7 @@ func (wsm *WebSocketManager) handleOrderMessage(wsConn *WebSocketConnection, ord
 		
 		if orderData.OrderStatus == "New" || (orderData.OrderType == "Market" && (orderData.OrderStatus == "Filled" || orderData.OrderStatus == "PartiallyFilled")) || isLimitExecutedQuickly {
 			wsm.addOrderToBuffer(wsConn.AccountID, orderData, wsConn)
-		} else if orderData.OrderStatus == "Cancelled" || (orderData.CancelType != "" && orderData.StopOrderType != "Stop" && orderData.OrderStatus != "Filled") {
+		} else if orderData.OrderStatus == "Cancelled" || (orderData.CancelType != "" && orderData.StopOrderType != "Stop" && orderData.OrderStatus != "Filled" && orderData.OrderStatus != "PartiallyFilled") {
 			// Excluir stops do processamento de cancelamento normal
 			wsm.addCancelToBuffer(wsConn.AccountID, orderData, wsConn)
 		}
