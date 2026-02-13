@@ -457,6 +457,7 @@ func (wsm *WebSocketManager) runConnection(wsConn *WebSocketConnection) {
 			// Conexão bem-sucedida - resetar contadores e delays
 			consecutiveFailures = 0
 			retryDelay = initialRetryDelay
+			retry = -1 // Resetar para -1 para que após retry++ volte para 0
 			
 			// Conexão fechada normalmente, verificar se deve reconectar
 			select {
@@ -469,6 +470,7 @@ func (wsm *WebSocketManager) runConnection(wsConn *WebSocketConnection) {
 				}
 				time.Sleep(initialRetryDelay)
 			}
+			continue // Garantir que o loop continue do início com retry resetado
 		}
 	}
 }
@@ -845,8 +847,9 @@ func (wsm *WebSocketManager) handleOrderMessage(wsConn *WebSocketConnection, ord
 
 	for _, orderData := range orderMsg.Data {
 		if logger != nil {
-			logger.Log("[DEBUG] Processando ordem - Category: %s, Status: %s, Symbol: %s",
-				orderData.Category, orderData.OrderStatus, orderData.Symbol)
+			jsonData, _ := json.Marshal(orderData)
+			logger.Log("[DEBUG] Processando ordem - Category: %s, Status: %s, Symbol: %s | JSON: %s",
+				orderData.Category, orderData.OrderStatus, orderData.Symbol, string(jsonData))
 		}
 
 		// Processar apenas ordens inverse
@@ -1364,7 +1367,7 @@ func (wsm *WebSocketManager) handleExecutionMessage(wsConn *WebSocketConnection,
 				execData.Symbol, execData.Side, execData.ExecPrice)
 		}
 
-		// Adicionar ao buffer de execution (inicia/reseta timer de 5 minutos)
+		// Adicionar ao buffer de execution (inicia/reseta timer de 15 minutos)
 		wsm.addExecutionToBuffer(wsConn.AccountID, wsConn)
 	}
 }
@@ -1503,7 +1506,8 @@ func (wsm *WebSocketManager) handleWalletMessage(wsConn *WebSocketConnection, wa
 			buffer.lastWallet = &walletCopy
 			buffer.mu.Unlock()
 			if logger != nil {
-				logger.Log("[DEBUG] Último wallet atualizado no buffer")
+				jsonData, _ := json.Marshal(walletCopy)
+				logger.Log("[DEBUG] Último wallet atualizado no buffer | JSON: %s", string(jsonData))
 			}
 		}
 		wsm.bufferMu.Unlock()
@@ -1530,13 +1534,13 @@ func (wsm *WebSocketManager) addExecutionToBuffer(accountID int64, wsConn *WebSo
 		buffer.positions = make(map[string]*PositionData)
 	}
 
-	// Se já existe timer, resetar para mais 5 minutos
+	// Se já existe timer, resetar para mais 15 minutos
 	if buffer.timer != nil {
 		buffer.timer.Stop()
 	}
 
-	// Iniciar/resetar timer de 5 minutos
-	buffer.timer = time.AfterFunc(5*time.Minute, func() {
+	// Iniciar/resetar timer de 15 minutos
+	buffer.timer = time.AfterFunc(15*time.Minute, func() {
 		defer func() {
 			if r := recover(); r != nil {
 				fmt.Fprintf(os.Stderr, "[PANIC] processExecutionBuffer (timer) para conta %d: %v\n", accountID, r)
@@ -1546,7 +1550,7 @@ func (wsm *WebSocketManager) addExecutionToBuffer(accountID int64, wsConn *WebSo
 	})
 	logger, _ := getLogger(accountID, wsConn.Account.Name)
 	if logger != nil {
-		logger.Log("[DEBUG] Execução recebida, iniciando/resetando timer de 5 minutos")
+		logger.Log("[DEBUG] Execução recebida, iniciando/resetando timer de 15 minutos")
 	}
 }
 
@@ -1753,7 +1757,7 @@ func (wsm *WebSocketManager) processExecutionBuffer(accountID int64, wsConn *Web
 	wsm.sendNotification(wsConn, messageText)
 	logger, _ := getLogger(accountID, wsConn.Account.Name)
 	if logger != nil {
-		logger.Log("[DEBUG] Notificação de posição enviada após 5 minutos sem execuções")
+		logger.Log("[DEBUG] Notificação de posição enviada após 15 minutos sem execuções")
 	}
 }
 
