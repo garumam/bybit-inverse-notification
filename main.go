@@ -53,7 +53,6 @@ func main() {
 			handleViewLogs(wsManager.accountManager, scanner)
 		case "9":
 			fmt.Println("Saindo...")
-			wsManager.StopAll()
 			return
 		default:
 		}
