@@ -1132,28 +1132,35 @@ func (wsm *WebSocketManager) processOrderBuffer(accountID int64, wsConn *WebSock
 		// Obter preço de exibição para a primeira ordem
 		displayPrice := getDisplayPrice(firstOrder)
 
+		var orderIcon string
+		if firstOrder.Side == "Buy" {
+			orderIcon = "🟢" // Círculo verde para Buy
+		} else {
+			orderIcon = "🔴" // Círculo vermelho para Sell
+		}
+
 		// Construir mensagem
 		var messageText string
 		if len(groupOrders) == 1 {
 			// Uma única ordem
-			messageText = fmt.Sprintf("🟢 Nova ordem aberta - %s %s%s %s @ %s (Qty: %.2f USD)",
-				firstOrder.Symbol, reducePrefix, firstOrder.Side, firstOrder.OrderType, displayPrice, totalQty)
+			messageText = fmt.Sprintf("%s Nova ordem aberta - %s %s%s %s @ %s (Qty: %.2f USD)",
+				orderIcon, firstOrder.Symbol, reducePrefix, firstOrder.Side, firstOrder.OrderType, displayPrice, totalQty)
 		} else {
 			// Múltiplas ordens agrupadas (scale orders)
 			if minPrice == maxPrice {
 				// Todas no mesmo preço
-				messageText = fmt.Sprintf("🟢 %d ordens %s%s %s agrupadas - %s @ %s (Qty Total: %.2f USD)",
-					len(groupOrders), reducePrefix, firstOrder.Side, firstOrder.OrderType, firstOrder.Symbol, displayPrice, totalQty)
+				messageText = fmt.Sprintf("%s %d ordens %s%s %s agrupadas - %s @ %s (Qty Total: %.2f USD)",
+					orderIcon, len(groupOrders), reducePrefix, firstOrder.Side, firstOrder.OrderType, firstOrder.Symbol, displayPrice, totalQty)
 			} else {
 				// Range de preços
-				messageText = fmt.Sprintf("🟢 %d ordens %s%s %s agrupadas - %s\n   Range: %.2f até %.2f\n   Qty Total: %.2f USD",
-					len(groupOrders), reducePrefix, firstOrder.Side, firstOrder.OrderType, firstOrder.Symbol,
+				messageText = fmt.Sprintf("%s %d ordens %s%s %s agrupadas - %s\n   Range: %.2f até %.2f\n   Qty Total: %.2f USD",
+					orderIcon, len(groupOrders), reducePrefix, firstOrder.Side, firstOrder.OrderType, firstOrder.Symbol,
 					minPrice, maxPrice, totalQty)
 			}
 		}
 
-		// Enviar notificação
-		wsm.sendNotification(wsConn, messageText)
+		// Enviar notificação (ordem)
+		wsm.sendNotificationWithType(wsConn, messageText, true, false)
 		logger, _ := getLogger(accountID, wsConn.Account.Name)
 		if logger != nil {
 			logger.Log("[DEBUG] Processado grupo %s: %d ordens", key, len(groupOrders))
@@ -1236,8 +1243,8 @@ func (wsm *WebSocketManager) processCancelBuffer(accountID int64, wsConn *WebSoc
 
 	messageText := strings.Join(messageParts, "\n")
 
-	// Enviar notificação
-	wsm.sendNotification(wsConn, messageText)
+	// Enviar notificação (ordem)
+	wsm.sendNotificationWithType(wsConn, messageText, true, false)
 	logger, _ := getLogger(accountID, wsConn.Account.Name)
 	if logger != nil {
 		logger.Log("[DEBUG] Processado %d cancelamentos agrupados", len(orders))
@@ -1274,8 +1281,8 @@ func (wsm *WebSocketManager) processStopOrder(wsConn *WebSocketConnection, order
 	messageText := fmt.Sprintf("%s Stop %s%s %s - %s @ %.2f (Qty: %.2f USD)",
 		stopIcon, reducePrefix, order.Side, order.OrderType, order.Symbol, triggerPrice, qty)
 
-	// Enviar notificação imediatamente
-	wsm.sendNotification(wsConn, messageText)
+	// Enviar notificação imediatamente (ordem)
+	wsm.sendNotificationWithType(wsConn, messageText, true, false)
 	logger, _ := getLogger(wsConn.AccountID, wsConn.Account.Name)
 	if logger != nil {
 		logger.Log("[DEBUG] Stop order processado - %s %s%s @ %.2f", order.Symbol, reducePrefix, order.Side, triggerPrice)
@@ -1312,8 +1319,8 @@ func (wsm *WebSocketManager) processStopCancellation(wsConn *WebSocketConnection
 	messageText := fmt.Sprintf("❌ %s Stop %s%s %s **CANCELADO** - %s @ %.2f (Qty: %.2f USD)",
 		stopIcon, reducePrefix, order.Side, order.OrderType, order.Symbol, triggerPrice, qty)
 
-	// Enviar notificação imediatamente
-	wsm.sendNotification(wsConn, messageText)
+	// Enviar notificação imediatamente (ordem)
+	wsm.sendNotificationWithType(wsConn, messageText, true, false)
 	logger, _ := getLogger(wsConn.AccountID, wsConn.Account.Name)
 	if logger != nil {
 		logger.Log("[DEBUG] Stop cancelado processado - %s %s%s @ %.2f", order.Symbol, reducePrefix, order.Side, triggerPrice)
@@ -1753,8 +1760,8 @@ func (wsm *WebSocketManager) processExecutionBuffer(accountID int64, wsConn *Web
 
 	messageText := strings.Join(messageParts, "\n")
 
-	// Enviar notificação
-	wsm.sendNotification(wsConn, messageText)
+	// Enviar notificação (carteira)
+	wsm.sendNotificationWithType(wsConn, messageText, false, true)
 	logger, _ := getLogger(accountID, wsConn.Account.Name)
 	if logger != nil {
 		logger.Log("[DEBUG] Notificação de posição enviada após 15 minutos sem execuções")
@@ -1762,6 +1769,10 @@ func (wsm *WebSocketManager) processExecutionBuffer(accountID int64, wsConn *Web
 }
 
 func (wsm *WebSocketManager) sendNotification(wsConn *WebSocketConnection, messageText string) {
+	wsm.sendNotificationWithType(wsConn, messageText, false, false)
+}
+
+func (wsm *WebSocketManager) sendNotificationWithType(wsConn *WebSocketConnection, messageText string, isOrder bool, isWallet bool) {
 	// Capturar panics
 	defer func() {
 		if r := recover(); r != nil {
@@ -1784,6 +1795,14 @@ func (wsm *WebSocketManager) sendNotification(wsConn *WebSocketConnection, messa
 	
 	alertIcon := "🔔" // Altere aqui para escolher outro ícone
 	
+	// Verificar se deve adicionar @everyone
+	everyoneTag := ""
+	if isOrder && wsConn.Account.MarkEveryoneOrder {
+		everyoneTag = "@everyone "
+	} else if isWallet && wsConn.Account.MarkEveryoneWallet {
+		everyoneTag = "@everyone "
+	}
+	
 	// Obter data/hora atual no horário de Brasília (funciona no Windows e Linux)
 	now := getBrasiliaTime()
 	timeStamp := fmt.Sprintf("🕘  %s - %s (Horário de Brasília)",
@@ -1793,7 +1812,7 @@ func (wsm *WebSocketManager) sendNotification(wsConn *WebSocketConnection, messa
 	if wsConn.Account.WebhookURL != "" {
 		// Enviar para Discord
 		// Discord remove quebras de linha no início, então precisamos ter conteúdo antes
-		discordMsg := fmt.Sprintf("%s\n%s\n\n%s", alertIcon, messageText, timeStamp)
+		discordMsg := fmt.Sprintf("%s%s\n%s\n\n%s", everyoneTag, alertIcon, messageText, timeStamp)
 		if err := sendDiscordWebhook(wsConn.Account.WebhookURL, discordMsg); err != nil {
 			// Fallback para logger em caso de erro no webhook
 			if logger != nil {

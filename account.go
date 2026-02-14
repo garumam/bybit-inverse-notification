@@ -6,12 +6,14 @@ import (
 )
 
 type BybitAccount struct {
-	ID         int64
-	Name       string
-	APIKey     string
-	APISecret  string
-	WebhookURL string
-	Active     bool
+	ID                 int64
+	Name               string
+	APIKey             string
+	APISecret          string
+	WebhookURL         string
+	Active             bool
+	MarkEveryoneOrder  bool
+	MarkEveryoneWallet bool
 }
 
 type AccountManager struct {
@@ -23,11 +25,24 @@ func NewAccountManager(db *Database) *AccountManager {
 }
 
 func (am *AccountManager) AddAccount(account *BybitAccount) error {
-	query := `INSERT INTO bybit_accounts (name, api_key, api_secret, webhook_url, active) 
-	          VALUES (?, ?, ?, ?, ?)`
+	query := `INSERT INTO bybit_accounts (name, api_key, api_secret, webhook_url, active, mark_everyone_order, mark_everyone_wallet) 
+	          VALUES (?, ?, ?, ?, ?, ?, ?)`
+	
+	markEveryoneOrder := 0
+	if account.MarkEveryoneOrder {
+		markEveryoneOrder = 1
+	}
+	markEveryoneWallet := 0
+	if account.MarkEveryoneWallet {
+		markEveryoneWallet = 1
+	}
+	active := 0
+	if account.Active {
+		active = 1
+	}
 	
 	_, err := am.db.GetDB().Exec(query, account.Name, account.APIKey, account.APISecret, 
-		account.WebhookURL, account.Active)
+		account.WebhookURL, active, markEveryoneOrder, markEveryoneWallet)
 	return err
 }
 
@@ -43,7 +58,7 @@ func (am *AccountManager) RemoveAccount(id int64) error {
 }
 
 func (am *AccountManager) ListAccounts() ([]*BybitAccount, error) {
-	query := `SELECT id, name, api_key, api_secret, webhook_url, active 
+	query := `SELECT id, name, api_key, api_secret, webhook_url, active, mark_everyone_order, mark_everyone_wallet 
 	          FROM bybit_accounts ORDER BY id`
 	
 	rows, err := am.db.GetDB().Query(query)
@@ -55,13 +70,15 @@ func (am *AccountManager) ListAccounts() ([]*BybitAccount, error) {
 	var accounts []*BybitAccount
 	for rows.Next() {
 		acc := &BybitAccount{}
-		var active int
+		var active, markEveryoneOrder, markEveryoneWallet int
 		err := rows.Scan(&acc.ID, &acc.Name, &acc.APIKey, &acc.APISecret, 
-			&acc.WebhookURL, &active)
+			&acc.WebhookURL, &active, &markEveryoneOrder, &markEveryoneWallet)
 		if err != nil {
 			return nil, err
 		}
 		acc.Active = active == 1
+		acc.MarkEveryoneOrder = markEveryoneOrder == 1
+		acc.MarkEveryoneWallet = markEveryoneWallet == 1
 		accounts = append(accounts, acc)
 	}
 
@@ -69,14 +86,14 @@ func (am *AccountManager) ListAccounts() ([]*BybitAccount, error) {
 }
 
 func (am *AccountManager) GetAccount(id int64) (*BybitAccount, error) {
-	query := `SELECT id, name, api_key, api_secret, webhook_url, active 
+	query := `SELECT id, name, api_key, api_secret, webhook_url, active, mark_everyone_order, mark_everyone_wallet 
 	          FROM bybit_accounts WHERE id = ?`
 	
 	acc := &BybitAccount{}
-	var active int
+	var active, markEveryoneOrder, markEveryoneWallet int
 	err := am.db.GetDB().QueryRow(query, id).Scan(
 		&acc.ID, &acc.Name, &acc.APIKey, &acc.APISecret, 
-		&acc.WebhookURL, &active)
+		&acc.WebhookURL, &active, &markEveryoneOrder, &markEveryoneWallet)
 	
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -86,6 +103,8 @@ func (am *AccountManager) GetAccount(id int64) (*BybitAccount, error) {
 	}
 	
 	acc.Active = active == 1
+	acc.MarkEveryoneOrder = markEveryoneOrder == 1
+	acc.MarkEveryoneWallet = markEveryoneWallet == 1
 	return acc, nil
 }
 
@@ -121,9 +140,18 @@ func (am *AccountManager) GetActiveConnections() ([]int64, error) {
 	return accountIDs, rows.Err()
 }
 
-func (am *AccountManager) UpdateAccount(id int64, name, webhookURL string) error {
-	query := `UPDATE bybit_accounts SET name = ?, webhook_url = ? WHERE id = ?`
-	_, err := am.db.GetDB().Exec(query, name, webhookURL, id)
+func (am *AccountManager) UpdateAccount(id int64, name, webhookURL string, markEveryoneOrder, markEveryoneWallet bool) error {
+	markEveryoneOrderInt := 0
+	if markEveryoneOrder {
+		markEveryoneOrderInt = 1
+	}
+	markEveryoneWalletInt := 0
+	if markEveryoneWallet {
+		markEveryoneWalletInt = 1
+	}
+	
+	query := `UPDATE bybit_accounts SET name = ?, webhook_url = ?, mark_everyone_order = ?, mark_everyone_wallet = ? WHERE id = ?`
+	_, err := am.db.GetDB().Exec(query, name, webhookURL, markEveryoneOrderInt, markEveryoneWalletInt, id)
 	return err
 }
 

@@ -140,6 +140,22 @@ func handleAddAccount(manager *AccountManager, scanner *bufio.Scanner) {
 		return
 	}
 
+	fmt.Print("Marcar @everyone em notificações de ordens? (sim/s ou não/n, padrão: não): ")
+	scanner.Scan()
+	markEveryoneOrderInput := strings.ToLower(strings.TrimSpace(scanner.Text()))
+	markEveryoneOrder := markEveryoneOrderInput == "sim" || markEveryoneOrderInput == "s"
+	if markEveryoneOrderInput == "cancelar" || markEveryoneOrderInput == "0" {
+		return
+	}
+
+	fmt.Print("Marcar @everyone em notificações de carteira? (sim/s ou não/n, padrão: não): ")
+	scanner.Scan()
+	markEveryoneWalletInput := strings.ToLower(strings.TrimSpace(scanner.Text()))
+	markEveryoneWallet := markEveryoneWalletInput == "sim" || markEveryoneWalletInput == "s"
+	if markEveryoneWalletInput == "cancelar" || markEveryoneWalletInput == "0" {
+		return
+	}
+
 	if nome == "" || apiKey == "" || apiSecret == "" {
 		fmt.Println("Erro: Nome, API Key e API Secret são obrigatórios!")
 		fmt.Println("\nPressione Enter para voltar ao menu principal...")
@@ -148,11 +164,13 @@ func handleAddAccount(manager *AccountManager, scanner *bufio.Scanner) {
 	}
 
 	account := &BybitAccount{
-		Name:       nome,
-		APIKey:     apiKey,
-		APISecret:  apiSecret,
-		WebhookURL: webhookURL,
-		Active:     true,
+		Name:               nome,
+		APIKey:             apiKey,
+		APISecret:          apiSecret,
+		WebhookURL:         webhookURL,
+		Active:             true,
+		MarkEveryoneOrder:  markEveryoneOrder,
+		MarkEveryoneWallet: markEveryoneWallet,
 	}
 
 	if err := manager.AddAccount(account); err != nil {
@@ -193,6 +211,8 @@ func handleListAccounts(manager *AccountManager, wsManager *WebSocketManager, sc
 			}
 			fmt.Printf("   Status: %s\n", getStatusText(acc.Active))
 			fmt.Printf("   Monitoramento: %s\n", monitoringStatus)
+			fmt.Printf("   Marcar @everyone em ordens: %s\n", getBooleanText(acc.MarkEveryoneOrder))
+			fmt.Printf("   Marcar @everyone no balance da carteira: %s\n", getBooleanText(acc.MarkEveryoneWallet))
 		}
 		fmt.Printf("\nTotal: %d conta(s) cadastrada(s)\n", len(accounts))
 	}
@@ -372,11 +392,43 @@ func handleEditAccount(manager *AccountManager, wsManager *WebSocketManager, sca
 		newWebhook = ""
 	}
 
+	currentMarkEveryoneOrder := "Não"
+	if account.MarkEveryoneOrder {
+		currentMarkEveryoneOrder = "Sim"
+	}
+	fmt.Printf("\nMarcar @everyone em notificações de ordens atual: %s\n", currentMarkEveryoneOrder)
+	fmt.Print("Novo valor (pressione Enter para manter o atual, sim/s para ativar, não/n para desativar): ")
+	scanner.Scan()
+	markEveryoneOrderInput := strings.ToLower(strings.TrimSpace(scanner.Text()))
+	if markEveryoneOrderInput == "cancelar" || markEveryoneOrderInput == "0" {
+		return
+	}
+	newMarkEveryoneOrder := account.MarkEveryoneOrder
+	if markEveryoneOrderInput != "" {
+		newMarkEveryoneOrder = markEveryoneOrderInput == "sim" || markEveryoneOrderInput == "s"
+	}
+
+	currentMarkEveryoneWallet := "Não"
+	if account.MarkEveryoneWallet {
+		currentMarkEveryoneWallet = "Sim"
+	}
+	fmt.Printf("\nMarcar @everyone em notificações de carteira atual: %s\n", currentMarkEveryoneWallet)
+	fmt.Print("Novo valor (pressione Enter para manter o atual, sim/s para ativar, não/n para desativar): ")
+	scanner.Scan()
+	markEveryoneWalletInput := strings.ToLower(strings.TrimSpace(scanner.Text()))
+	if markEveryoneWalletInput == "cancelar" || markEveryoneWalletInput == "0" {
+		return
+	}
+	newMarkEveryoneWallet := account.MarkEveryoneWallet
+	if markEveryoneWalletInput != "" {
+		newMarkEveryoneWallet = markEveryoneWalletInput == "sim" || markEveryoneWalletInput == "s"
+	}
+
 	// Verificar se a conta está sendo monitorada antes de editar
 	wasMonitored := wsManager.IsConnectionActive(account.ID)
 
 	// Atualizar conta
-	if err := manager.UpdateAccount(account.ID, newName, newWebhook); err != nil {
+	if err := manager.UpdateAccount(account.ID, newName, newWebhook, newMarkEveryoneOrder, newMarkEveryoneWallet); err != nil {
 		fmt.Printf("\nErro ao editar conta: %v\n", err)
 		fmt.Println("\nPressione Enter para voltar ao menu principal...")
 		scanner.Scan()
@@ -561,6 +613,13 @@ func getStatusText(active bool) string {
 	return "Inativa"
 }
 
+func getBooleanText(value bool) string {
+	if value {
+		return "Sim"
+	}
+	return "Não"
+}
+
 func handleViewMonitoredAccounts(wsManager *WebSocketManager, scanner *bufio.Scanner) {
 	clearScreen()
 	accounts, err := wsManager.accountManager.ListAccounts()
@@ -589,6 +648,8 @@ func handleViewMonitoredAccounts(wsManager *WebSocketManager, scanner *bufio.Sca
 				fmt.Printf("   Webhook Discord: Não configurado (notificações no terminal)\n")
 			}
 			fmt.Printf("   Status: Monitorando\n")
+			fmt.Printf("   Marcar @everyone em ordens: %s\n", getBooleanText(acc.MarkEveryoneOrder))
+			fmt.Printf("   Marcar @everyone em carteira: %s\n", getBooleanText(acc.MarkEveryoneWallet))
 		}
 		fmt.Printf("\nTotal: %d conta(s) sendo monitorada(s)\n", len(monitoredAccounts))
 	}

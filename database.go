@@ -69,11 +69,58 @@ func (d *Database) initSchema() error {
 		return err
 	}
 
+	// Adicionar novas colunas se não existirem
+	if err := d.addColumnIfNotExists("bybit_accounts", "mark_everyone_order", "INTEGER DEFAULT 0"); err != nil {
+		return err
+	}
+
+	if err := d.addColumnIfNotExists("bybit_accounts", "mark_everyone_wallet", "INTEGER DEFAULT 0"); err != nil {
+		return err
+	}
+
 	return nil
 }
 
 func (d *Database) GetDB() *sql.DB {
 	return d.db
+}
+
+// addColumnIfNotExists verifica se uma coluna existe na tabela e a adiciona se não existir
+func (d *Database) addColumnIfNotExists(tableName, columnName, columnDefinition string) error {
+	// Verificar se a coluna já existe usando PRAGMA table_info
+	rows, err := d.db.Query("PRAGMA table_info(" + tableName + ")")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	columnExists := false
+	for rows.Next() {
+		var cid int
+		var name string
+		var dataType string
+		var notNull int
+		var defaultValue interface{}
+		var pk int
+
+		if err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &pk); err != nil {
+			return err
+		}
+
+		if name == columnName {
+			columnExists = true
+			break
+		}
+	}
+
+	if !columnExists {
+		alterTableSQL := "ALTER TABLE " + tableName + " ADD COLUMN " + columnName + " " + columnDefinition
+		if _, err := d.db.Exec(alterTableSQL); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func getDataDir() string {
