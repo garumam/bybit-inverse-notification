@@ -388,7 +388,7 @@ func (wsm *WebSocketManager) runConnection(wsConn *WebSocketConnection) {
 
 	maxRetries := 999999 // Reconexão infinita
 	retryDelay := time.Second * 5
-	maxRetryDelay := time.Minute * 5
+	maxRetryDelay := time.Minute * 1
 	initialRetryDelay := retryDelay
 
 	logger, err := getLogger(wsConn.AccountID, wsConn.Account.Name)
@@ -431,51 +431,103 @@ func (wsm *WebSocketManager) runConnection(wsConn *WebSocketConnection) {
 			}
 		}
 
-		if err := wsm.connectAndListen(wsConn); err != nil {
-			// Verificar se foi parado manualmente
-			select {
-			case <-wsConn.StopChan:
-				return
-			default:
-			}
+		// Canal para receber sinal de sucesso da conexão
+		successChan := make(chan bool, 1)
+		
+		// Iniciar conexão em goroutine para poder receber o sinal de sucesso
+		errChan := make(chan error, 1)
+		go func() {
+			errChan <- wsm.connectAndListen(wsConn, successChan)
+		}()
 
-			consecutiveFailures++
-			if logger != nil {
-				logger.Log("Erro na conexão WebSocket (tentativa %d, falhas consecutivas: %d): %v", retry+1, consecutiveFailures, err)
-			}
-
-			// Exponential backoff com limite máximo
-			select {
-			case <-wsConn.StopChan:
-				return
-			case <-time.After(retryDelay):
-				if retryDelay < maxRetryDelay {
-					retryDelay *= 2
-				}
-			}
-		} else {
-			// Conexão bem-sucedida - resetar contadores e delays
-			consecutiveFailures = 0
-			retryDelay = initialRetryDelay
-			retry = -1 // Resetar para -1 para que após retry++ volte para 0
-			
-			// Conexão fechada normalmente, verificar se deve reconectar
-			select {
-			case <-wsConn.StopChan:
-				return
-			default:
-				// Reconectar após um delay curto
+		// Aguardar sinal de sucesso ou erro
+		select {
+		case <-wsConn.StopChan:
+			return
+		case success := <-successChan:
+			if success {
+				// Conexão estabelecida com sucesso - resetar contadores e delays
+				consecutiveFailures = 0
+				retryDelay = initialRetryDelay
+				retry = -1 // Resetar para -1 para que após retry++ volte para 0
 				if logger != nil {
-					logger.Log("Conexão fechada, tentando reconectar...")
+					logger.Log("✅ Conexão estabelecida com sucesso, retry resetado")
 				}
-				time.Sleep(initialRetryDelay)
 			}
-			continue // Garantir que o loop continue do início com retry resetado
+			// Continuar para aguardar erro da conexão (quando ela cair)
+		case err := <-errChan:
+			// Erro antes de estabelecer conexão
+			if err != nil {
+				// Verificar se foi parado manualmente
+				select {
+				case <-wsConn.StopChan:
+					return
+				default:
+				}
+
+				consecutiveFailures++
+				if logger != nil {
+					logger.Log("Erro na conexão WebSocket (tentativa %d, falhas consecutivas: %d): %v", retry+1, consecutiveFailures, err)
+				}
+
+				// Exponential backoff com limite máximo
+				select {
+				case <-wsConn.StopChan:
+					return
+				case <-time.After(retryDelay):
+					if retryDelay < maxRetryDelay {
+						retryDelay *= 2
+					}
+				}
+				continue
+			}
+		}
+
+		// Aguardar erro da conexão (quando ela cair)
+		select {
+		case <-wsConn.StopChan:
+			return
+		case err := <-errChan:
+			if err != nil {
+				// Verificar se foi parado manualmente
+				select {
+				case <-wsConn.StopChan:
+					return
+				default:
+				}
+
+				consecutiveFailures++
+				if logger != nil {
+					logger.Log("Erro na conexão WebSocket (tentativa %d, falhas consecutivas: %d): %v", retry+1, consecutiveFailures, err)
+				}
+
+				// Exponential backoff com limite máximo
+				select {
+				case <-wsConn.StopChan:
+					return
+				case <-time.After(retryDelay):
+					if retryDelay < maxRetryDelay {
+						retryDelay *= 2
+					}
+				}
+			} else {
+				// Conexão fechada normalmente, verificar se deve reconectar
+				select {
+				case <-wsConn.StopChan:
+					return
+				default:
+					// Reconectar após um delay curto
+					if logger != nil {
+						logger.Log("Conexão fechada, tentando reconectar...")
+					}
+					time.Sleep(initialRetryDelay)
+				}
+			}
 		}
 	}
 }
 
-func (wsm *WebSocketManager) connectAndListen(wsConn *WebSocketConnection) (err error) {
+func (wsm *WebSocketManager) connectAndListen(wsConn *WebSocketConnection, successChan chan<- bool) (err error) {
 	// Capturar panics
 	defer func() {
 		if r := recover(); r != nil {
@@ -560,6 +612,16 @@ func (wsm *WebSocketManager) connectAndListen(wsConn *WebSocketConnection) (err 
 
 	if logger != nil {
 		logger.Log("WebSocket conectado, autenticado e inscrito nos tópicos 'order', 'execution', 'position' e 'wallet'")
+	}
+
+	// Sinalizar sucesso após conexão, autenticação e inscrição bem-sucedidas
+	// Isso permite resetar o retry antes de entrar no loop de leitura
+	if successChan != nil {
+		select {
+		case successChan <- true:
+		default:
+			// Canal cheio ou fechado, não bloquear
+		}
 	}
 
 	// Configurar timeouts e pong handler
@@ -1051,6 +1113,40 @@ func (wsm *WebSocketManager) processOrderBuffer(accountID int64, wsConn *WebSock
 
 	delete(wsm.orderBuffers, accountID)
 	wsm.bufferMu.Unlock()
+
+	if len(orders) == 0 {
+		return
+	}
+
+	// Filtrar ordens duplicadas: manter apenas a mais recente por orderId
+	orderMap := make(map[string]OrderData)
+	for _, order := range orders {
+		existingOrder, exists := orderMap[order.OrderID]
+		if !exists {
+			// Primeira ocorrência deste orderId
+			orderMap[order.OrderID] = order
+		} else {
+			// Comparar updatedTime para manter a mais recente
+			existingUpdatedTime, err1 := strconv.ParseInt(existingOrder.UpdatedTime, 10, 64)
+			currentUpdatedTime, err2 := strconv.ParseInt(order.UpdatedTime, 10, 64)
+			
+			// Se houver erro ao parsear, manter a existente
+			if err1 != nil || err2 != nil {
+				continue
+			}
+			
+			// Se a ordem atual é mais recente, substituir
+			if currentUpdatedTime > existingUpdatedTime {
+				orderMap[order.OrderID] = order
+			}
+		}
+	}
+
+	// Converter o mapa de volta para slice
+	orders = make([]OrderData, 0, len(orderMap))
+	for _, order := range orderMap {
+		orders = append(orders, order)
+	}
 
 	if len(orders) == 0 {
 		return
