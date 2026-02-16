@@ -155,3 +155,26 @@ func (am *AccountManager) UpdateAccount(id int64, name, webhookURL string, markE
 	return err
 }
 
+// Métodos para gerenciar ordens
+func (am *AccountManager) SaveOrder(orderID string, accountID int64, orderDataJSON string) error {
+	query := `INSERT OR REPLACE INTO orders (order_id, account_id, order_data) VALUES (?, ?, ?)`
+	_, err := am.db.GetDB().Exec(query, orderID, accountID, orderDataJSON)
+	return err
+}
+
+func (am *AccountManager) GetOrder(orderID string) (string, error) {
+	var orderData string
+	query := `SELECT order_data FROM orders WHERE order_id = ?`
+	err := am.db.GetDB().QueryRow(query, orderID).Scan(&orderData)
+	if err != nil {
+		return "", err
+	}
+	return orderData, nil
+}
+
+func (am *AccountManager) DeleteOrder(orderID string) error {
+	query := `DELETE FROM orders WHERE order_id = ?`
+	_, err := am.db.GetDB().Exec(query, orderID)
+	return err
+}
+

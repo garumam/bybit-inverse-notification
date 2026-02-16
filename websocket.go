@@ -181,6 +181,23 @@ func NewWebSocketManager(db *Database, accountManager *AccountManager) *WebSocke
 	}
 }
 
+// getDisplayPrice retorna o preço correto a ser exibido para uma ordem
+// Se for Market e tiver avgPrice, usa avgPrice
+// Se for Limit preenchido e tiver avgPrice, usa avgPrice
+// Caso contrário, usa Price
+func getDisplayPrice(order OrderData) string {
+	// Se for Market e tiver avgPrice, usar avgPrice
+	if order.OrderType == "Market" && order.AvgPrice != "" && order.AvgPrice != "0" {
+		return order.AvgPrice
+	}
+
+	if order.OrderType == "Limit" && order.AvgPrice != "" && order.AvgPrice != "0" && (order.OrderStatus == "Filled" || order.OrderStatus == "PartiallyFilled") {
+		return order.AvgPrice
+	}
+	// Caso contrário, usar Price
+	return order.Price
+}
+
 func (wsm *WebSocketManager) StartConnection(accountID int64) error {
 	wsm.mu.Lock()
 	defer wsm.mu.Unlock()
@@ -955,7 +972,9 @@ func (wsm *WebSocketManager) handleOrderMessage(wsConn *WebSocketConnection, ord
 
 		// Processar abertura de ordem ou cancelamento
 		// Verificar se é Limit executada rapidamente (até 3 segundos entre criação e atualização)
+		// Verificar se a ordem Limit foi movida para outro preço
 		isLimitExecutedQuickly := false
+		isLimitMoved := false
 		if orderData.OrderType == "Limit" && (orderData.OrderStatus == "Filled" || orderData.OrderStatus == "PartiallyFilled") {
 			createdTime, err1 := strconv.ParseInt(orderData.CreatedTime, 10, 64)
 			updatedTime, err2 := strconv.ParseInt(orderData.UpdatedTime, 10, 64)
@@ -965,9 +984,26 @@ func (wsm *WebSocketManager) handleOrderMessage(wsConn *WebSocketConnection, ord
 					isLimitExecutedQuickly = true
 				}
 			}
+
+			// Verificar se ordem existe no banco
+			existingOrderJSON, err := wsm.accountManager.GetOrder(orderData.OrderID)
+			if err == nil && existingOrderJSON != "" {
+				// Ordem existe, verificar se o preço mudou
+				var existingOrder OrderData
+				if err := json.Unmarshal([]byte(existingOrderJSON), &existingOrder); err == nil {
+					// Usar getDisplayPrice para obter os preços corretos
+					oldPriceStr := getDisplayPrice(existingOrder)
+					newPriceStr := getDisplayPrice(orderData)
+					
+					// Comparar preços usando os valores corretos
+					if oldPriceStr != newPriceStr {
+						isLimitMoved = true
+					}
+				}
+			}
 		}
-		
-		if orderData.OrderStatus == "New" || (orderData.OrderType == "Market" && (orderData.OrderStatus == "Filled" || orderData.OrderStatus == "PartiallyFilled")) || isLimitExecutedQuickly {
+
+		if orderData.OrderStatus == "New" || (orderData.OrderType == "Market" && (orderData.OrderStatus == "Filled" || orderData.OrderStatus == "PartiallyFilled")) || isLimitExecutedQuickly || isLimitMoved {
 			wsm.addOrderToBuffer(wsConn.AccountID, orderData, wsConn)
 		} else if orderData.OrderStatus == "Cancelled" || (orderData.CancelType != "" && orderData.StopOrderType != "Stop" && orderData.OrderStatus != "Filled" && orderData.OrderStatus != "PartiallyFilled") {
 			// Excluir stops do processamento de cancelamento normal
@@ -1155,6 +1191,103 @@ func (wsm *WebSocketManager) processOrderBuffer(accountID int64, wsConn *WebSock
 	// Usar a conexão ativa
 	wsConn = activeConn
 
+	// Mapa para rastrear ordens que foram notificadas como movidas
+	movedOrders := make(map[string]bool)
+
+	// Verificar ordens no banco e detectar mudanças de preço
+	for _, order := range orders {
+		// Serializar ordem para JSON
+		orderJSON, err := json.Marshal(order)
+		if err != nil {
+			logger, _ := getLogger(accountID, wsConn.Account.Name)
+			if logger != nil {
+				logger.Log("[DEBUG] Erro ao serializar ordem %s: %v", order.OrderID, err)
+			}
+			continue
+		}
+
+		// Verificar se ordem já existe no banco
+		existingOrderJSON, err := wsm.accountManager.GetOrder(order.OrderID)
+		if err == nil && existingOrderJSON != "" {
+			// Ordem existe, verificar se o preço mudou
+			var existingOrder OrderData
+			if err := json.Unmarshal([]byte(existingOrderJSON), &existingOrder); err == nil {
+				// Usar getDisplayPrice para obter os preços corretos
+				oldPriceStr := getDisplayPrice(existingOrder)
+				newPriceStr := getDisplayPrice(order)
+				
+				// Comparar preços usando os valores corretos
+				if oldPriceStr != newPriceStr {
+					// Preço mudou - criar notificação especial
+					reducePrefix := ""
+					if order.ReduceOnly {
+						reducePrefix = "Reduce "
+					}
+					
+					var orderIcon string
+					if order.Side == "Buy" {
+						orderIcon = "🟢"
+					} else {
+						orderIcon = "🔴"
+					}
+
+					oldPrice, _ := strconv.ParseFloat(oldPriceStr, 64)
+					newPrice, _ := strconv.ParseFloat(newPriceStr, 64)
+
+					qty, err := strconv.ParseFloat(order.Qty, 64)
+					if err != nil {
+						// Erro ao parsear quantidade - pular esta ordem
+						continue
+					}
+
+					messageText := fmt.Sprintf("📝 %s Ordem movida - %s %s%s %s\n   Preço: %.2f → %.2f (Qty: %.2f USD)",
+						orderIcon, order.Symbol, reducePrefix, order.Side, order.OrderType, oldPrice, newPrice, qty)
+					
+					wsm.sendNotificationWithType(wsConn, messageText, true, false)
+					
+					// Marcar como movida para não notificar novamente
+					movedOrders[order.OrderID] = true
+					
+					logger, _ := getLogger(accountID, wsConn.Account.Name)
+					if logger != nil {
+						logger.Log("[DEBUG] Ordem %s movida de %.2f para %.2f", order.OrderID, oldPrice, newPrice)
+					}
+				}
+			}
+		}
+
+		if order.OrderStatus != "Filled" && order.OrderStatus != "PartiallyFilled" {
+			// Salvar/atualizar ordem no banco
+			if err := wsm.accountManager.SaveOrder(order.OrderID, accountID, string(orderJSON)); err != nil {
+				logger, _ := getLogger(accountID, wsConn.Account.Name)
+				if logger != nil {
+					logger.Log("[DEBUG] Erro ao salvar ordem %s no banco: %v", order.OrderID, err)
+				}
+			}
+		} else {
+			// Remover do banco se existir
+			if err := wsm.accountManager.DeleteOrder(order.OrderID); err != nil {
+				logger, _ := getLogger(accountID, wsConn.Account.Name)
+				if logger != nil {
+					logger.Log("[DEBUG] Erro ao remover ordem preenchida %s do banco: %v", order.OrderID, err)
+				}
+			}
+		}
+	}
+
+	// Filtrar ordens que foram notificadas como movidas
+	finalOrders := make([]OrderData, 0)
+	for _, order := range orders {
+		if !movedOrders[order.OrderID] {
+			finalOrders = append(finalOrders, order)
+		}
+	}
+	orders = finalOrders
+
+	if len(orders) == 0 {
+		return
+	}
+
 	// Agrupar ordens por tipo (Side + OrderType + ReduceOnly)
 	groups := make(map[string][]OrderData)
 	for _, order := range orders {
@@ -1177,20 +1310,6 @@ func (wsm *WebSocketManager) processOrderBuffer(accountID int64, wsConn *WebSock
 		reducePrefix := ""
 		if firstOrder.ReduceOnly {
 			reducePrefix = "Reduce "
-		}
-
-		// Função auxiliar para obter o preço a ser exibido
-		getDisplayPrice := func(order OrderData) string {
-			// Se for Market e tiver avgPrice, usar avgPrice
-			if order.OrderType == "Market" && order.AvgPrice != "" && order.AvgPrice != "0" {
-				return order.AvgPrice
-			}
-
-			if order.OrderType == "Limit" && order.AvgPrice != "" && order.AvgPrice != "0" && (order.OrderStatus == "Filled" || order.OrderStatus == "PartiallyFilled") {
-				return order.AvgPrice
-			}
-			// Caso contrário, usar Price
-			return order.Price
 		}
 
 		// Calcular range de preços e quantidade total
@@ -1335,6 +1454,14 @@ func (wsm *WebSocketManager) processCancelBuffer(accountID int64, wsConn *WebSoc
 		}
 		messageParts = append(messageParts, fmt.Sprintf("  • %s %s%s %s @ %s",
 			order.Symbol, reducePrefix, order.Side, order.OrderType, order.Price))
+		
+		// Remover ordem do banco se existir
+		if err := wsm.accountManager.DeleteOrder(order.OrderID); err != nil {
+			logger, _ := getLogger(accountID, wsConn.Account.Name)
+			if logger != nil {
+				logger.Log("[DEBUG] Erro ao remover ordem %s do banco: %v", order.OrderID, err)
+			}
+		}
 	}
 
 	messageText := strings.Join(messageParts, "\n")
@@ -1363,6 +1490,67 @@ func (wsm *WebSocketManager) processStopOrder(wsConn *WebSocketConnection, order
 	qty, err := strconv.ParseFloat(order.Qty, 64)
 	if err != nil {
 		qty = 0
+	}
+
+	// Verificar se stop já existe no banco e detectar mudança de preço
+	existingOrderJSON, err := wsm.accountManager.GetOrder(order.OrderID)
+	orderMoved := false
+	if err == nil && existingOrderJSON != "" {
+		// Stop existe, verificar se o triggerPrice mudou
+		var existingOrder OrderData
+		if err := json.Unmarshal([]byte(existingOrderJSON), &existingOrder); err == nil {
+			// Comparar triggerPrice
+			if existingOrder.TriggerPrice != order.TriggerPrice {
+				// TriggerPrice mudou - criar notificação especial
+				var stopIcon string
+				if order.Side == "Buy" {
+					stopIcon = "🟢"
+				} else {
+					stopIcon = "🔴"
+				}
+
+				oldPrice, _ := strconv.ParseFloat(existingOrder.TriggerPrice, 64)
+				newPrice, _ := strconv.ParseFloat(order.TriggerPrice, 64)
+
+				messageText := fmt.Sprintf("📝 %s Stop movido - %s %s%s %s\n   Preço: %.2f → %.2f (Qty: %.2f USD)",
+					stopIcon, order.Symbol, reducePrefix, order.Side, order.OrderType, oldPrice, newPrice, qty)
+				
+				wsm.sendNotificationWithType(wsConn, messageText, true, false)
+				
+				orderMoved = true
+				
+				logger, _ := getLogger(wsConn.AccountID, wsConn.Account.Name)
+				if logger != nil {
+					logger.Log("[DEBUG] Stop %s movido de %.2f para %.2f", order.OrderID, oldPrice, newPrice)
+				}
+			}
+		}
+	}
+
+	// Salvar/atualizar stop no banco
+	orderJSON, err := json.Marshal(order)
+	if err == nil {
+		// Se a ordem está Filled ou PartiallyFilled, remover do banco e não processar
+		if order.OrderStatus != "Filled" && order.OrderStatus != "PartiallyFilled" {
+			if err := wsm.accountManager.SaveOrder(order.OrderID, wsConn.AccountID, string(orderJSON)); err != nil {
+				logger, _ := getLogger(wsConn.AccountID, wsConn.Account.Name)
+				if logger != nil {
+					logger.Log("[DEBUG] Erro ao salvar stop %s no banco: %v", order.OrderID, err)
+				}
+			}
+		} else {
+			if err := wsm.accountManager.DeleteOrder(order.OrderID); err != nil {
+				logger, _ := getLogger(wsConn.AccountID, wsConn.Account.Name)
+				if logger != nil {
+					logger.Log("[DEBUG] Erro ao remover stop preenchido %s do banco: %v", order.OrderID, err)
+				}
+			}
+		}
+	}
+
+	// Se a ordem foi notificada como movida, não enviar notificação normal
+	if orderMoved {
+		return
 	}
 
 	// Escolher ícone baseado no Side (Buy = verde, Sell = vermelho)
@@ -1401,6 +1589,14 @@ func (wsm *WebSocketManager) processStopCancellation(wsConn *WebSocketConnection
 	qty, err := strconv.ParseFloat(order.Qty, 64)
 	if err != nil {
 		qty = 0
+	}
+
+	// Remover stop do banco se existir
+	if err := wsm.accountManager.DeleteOrder(order.OrderID); err != nil {
+		logger, _ := getLogger(wsConn.AccountID, wsConn.Account.Name)
+		if logger != nil {
+			logger.Log("[DEBUG] Erro ao remover stop %s do banco: %v", order.OrderID, err)
+		}
 	}
 
 	// Escolher ícone baseado no Side (Buy = verde, Sell = vermelho)

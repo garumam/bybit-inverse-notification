@@ -61,11 +61,25 @@ func (d *Database) initSchema() error {
 		FOREIGN KEY (account_id) REFERENCES bybit_accounts(id) ON DELETE CASCADE
 	);`
 
+	// Tabela de ordens
+	createOrdersTable := `
+	CREATE TABLE IF NOT EXISTS orders (
+		order_id TEXT PRIMARY KEY,
+		account_id INTEGER NOT NULL,
+		order_data TEXT NOT NULL,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		FOREIGN KEY (account_id) REFERENCES bybit_accounts(id) ON DELETE CASCADE
+	);`
+
 	if _, err := d.db.Exec(createAccountsTable); err != nil {
 		return err
 	}
 
 	if _, err := d.db.Exec(createConnectionsTable); err != nil {
+		return err
+	}
+
+	if _, err := d.db.Exec(createOrdersTable); err != nil {
 		return err
 	}
 
