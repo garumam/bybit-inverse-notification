@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -467,9 +468,9 @@ func (wsm *WebSocketManager) runConnection(wsConn *WebSocketConnection) {
 				consecutiveFailures = 0
 				retryDelay = initialRetryDelay
 				retry = -1 // Resetar para -1 para que após retry++ volte para 0
-				if logger != nil {
-					logger.Log("✅ Conexão estabelecida com sucesso, retry resetado")
-				}
+				// if logger != nil {
+				// 	logger.Log("✅ Conexão estabelecida com sucesso, retry resetado")
+				// }
 			}
 			// Continuar para aguardar erro da conexão (quando ela cair)
 		case err := <-errChan:
@@ -627,9 +628,9 @@ func (wsm *WebSocketManager) connectAndListen(wsConn *WebSocketConnection, succe
 		return fmt.Errorf("erro ao inscrever: %w", err)
 	}
 
-	if logger != nil {
-		logger.Log("WebSocket conectado, autenticado e inscrito nos tópicos 'order', 'execution', 'position' e 'wallet'")
-	}
+	// if logger != nil {
+	// 	logger.Log("WebSocket conectado, autenticado e inscrito nos tópicos 'order', 'execution', 'position' e 'wallet'")
+	// }
 
 	// Sinalizar sucesso após conexão, autenticação e inscrição bem-sucedidas
 	// Isso permite resetar o retry antes de entrar no loop de leitura
@@ -698,9 +699,10 @@ func (wsm *WebSocketManager) connectAndListen(wsConn *WebSocketConnection, succe
 				}
 				
 				// Timeout ou erro de leitura, reconectar
-				if logger != nil {
-					logger.Log("Erro na leitura (timeout ou outro): %v", err)
-				}
+				// if logger != nil {
+				// 	logger.Log("Erro na leitura (timeout ou outro): %v", err)
+				// }
+				
 				// Limpar conexão antes de retornar
 				wsConn.mu.Lock()
 				if wsConn.Conn == conn {
@@ -847,9 +849,9 @@ func (wsm *WebSocketManager) handleMessage(wsConn *WebSocketConnection, message 
 			}
 			if op == "subscribe" {
 				if success, ok := controlMsg["success"].(bool); ok && success {
-					if logger != nil {
-						logger.Log("✅ Inscrição nos tópicos confirmada!")
-					}
+					// if logger != nil {
+					// 	logger.Log("✅ Inscrição nos tópicos confirmada!")
+					// }
 				} else {
 					if logger != nil {
 						logger.Log("⚠️ Inscrição pode ter falhado: %v", controlMsg)
@@ -1810,6 +1812,128 @@ func (wsm *WebSocketManager) handleWalletMessage(wsConn *WebSocketConnection, wa
 			}
 		}
 		wsm.bufferMu.Unlock()
+
+		// Enviar webhook do Google Sheets se configurado
+		if wsConn.Account.WebhookURLGoogleSheets != "" && wsConn.Account.SheetURLGoogleSheets != "" {
+			// Obter posições do buffer para calcular valores
+			wsm.bufferMu.RLock()
+			var positions map[string]*PositionData
+			if buffer, exists := wsm.executionBuffers[wsConn.AccountID]; exists {
+				buffer.mu.Lock()
+				if buffer.positions != nil {
+					positions = make(map[string]*PositionData)
+					for symbol, pos := range buffer.positions {
+						positions[symbol] = pos
+					}
+				}
+				buffer.mu.Unlock()
+			}
+			wsm.bufferMu.RUnlock()
+
+			// Função auxiliar para calcular proteção de uma posição (mesma lógica do processExecutionBuffer)
+			calculatePositionValues := func(position *PositionData, totalEquityCoin float64) (longUSD, protecaoUSD, expostoUSD float64) {
+				size, err := strconv.ParseFloat(position.Size, 64)
+				if err != nil {
+					size = 0
+				}
+
+				if position.Side == "Sell" {
+					protecaoUSD = size
+					longUSD = 0
+				} else {
+					protecaoUSD = 0
+					longUSD = size
+				}
+
+				expostoUSD = totalEquityCoin - size
+				return
+			}
+
+			// Processar cada Coin do walletData original (não mergeado)
+			for _, coinBalance := range walletData.Coin {
+				// Extrair moeda do símbolo para buscar posição
+				coin := coinBalance.Coin
+
+				// Tentar encontrar posição correspondente
+				var position *PositionData
+				for posSymbol, pos := range positions {
+					// Extrair moeda do símbolo
+					posCoin := posSymbol
+					if strings.HasSuffix(posSymbol, "USD") {
+						posCoin = posSymbol[:len(posSymbol)-3]
+					} else if strings.HasSuffix(posSymbol, "USDT") {
+						posCoin = posSymbol[:len(posSymbol)-4]
+					} else if strings.HasSuffix(posSymbol, "USDC") {
+						posCoin = posSymbol[:len(posSymbol)-4]
+					}
+
+					if posCoin == coin {
+						position = pos
+						break
+					}
+				}
+
+				// Calcular valores
+				equity, err := strconv.ParseFloat(coinBalance.Equity, 64)
+				if err != nil {
+					equity = 0
+				}
+
+				usdValue, err := strconv.ParseFloat(coinBalance.UsdValue, 64)
+				if err != nil {
+					usdValue = 0
+				}
+
+				var protecaoUSD, expostoUSD, longUSD float64
+				if position != nil {
+					longUSD, protecaoUSD, expostoUSD = calculatePositionValues(position, usdValue)
+				} else {
+					// Sem posição, valores são zero
+					protecaoUSD = 0
+					expostoUSD = usdValue
+					longUSD = 0
+				}
+
+				// Obter data/hora atual no horário de Brasília
+				now := getBrasiliaTime()
+				dateTimeStr := now.Format("02/01/2006 15:04")
+
+				// Montar columns
+				columns := []interface{}{
+					dateTimeStr,
+					coinBalance.Coin,
+					equity,
+					usdValue,
+					protecaoUSD,
+					expostoUSD,
+					longUSD,
+				}
+
+				// Headers
+				headers := []string{
+					"data",
+					"moeda",
+					"total_moeda",
+					"total_dolar",
+					"total_protegido",
+					"total_exposto",
+					"total_long",
+				}
+
+				// Enviar webhook
+				if err := sendGoogleSheetsWebhook(
+					wsConn.Account.WebhookURLGoogleSheets,
+					wsConn.Account.SheetURLGoogleSheets,
+					coinBalance.Coin,
+					columns,
+					headers,
+				); err != nil {
+					if logger != nil {
+						logger.Log("Erro ao enviar webhook do Google Sheets para %s: %v", coinBalance.Coin, err)
+					}
+				}
+			}
+		}
 	}
 }
 
@@ -2140,6 +2264,84 @@ func sendDiscordWebhook(webhookURL, message string) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("status code: %d", resp.StatusCode)
+	}
+
+	return nil
+}
+
+// validateGoogleSheetsWebhookURL valida se a URL do webhook do Google Sheets está no formato correto
+func validateGoogleSheetsWebhookURL(url string) bool {
+	if url == "" {
+		return true // URL vazia é válida (opcional)
+	}
+	// Validar formato: https://script.google.com/macros/s/.../exec
+	matched, _ := regexp.MatchString(`^https://script\.google\.com/macros/s/[A-Za-z0-9_-]+/exec$`, url)
+	return matched
+}
+
+// validateGoogleSheetsURL valida se a URL da planilha do Google Sheets está no formato correto
+func validateGoogleSheetsURL(url string) bool {
+	if url == "" {
+		return true // URL vazia é válida (opcional)
+	}
+	// Validar formato: https://docs.google.com/spreadsheets/d/.../edit...
+	matched, _ := regexp.MatchString(`^https://docs\.google\.com/spreadsheets/d/[A-Za-z0-9_-]+/`, url)
+	return matched
+}
+
+// extractSheetID extrai o ID da planilha da URL do Google Sheets
+func extractSheetID(sheetURL string) (string, error) {
+	if sheetURL == "" {
+		return "", fmt.Errorf("URL da planilha está vazia")
+	}
+	
+	// Padrão: /spreadsheets/d/{ID}/
+	re := regexp.MustCompile(`/spreadsheets/d/([A-Za-z0-9_-]+)`)
+	matches := re.FindStringSubmatch(sheetURL)
+	if len(matches) < 2 {
+		return "", fmt.Errorf("não foi possível extrair o ID da planilha da URL: %s", sheetURL)
+	}
+	
+	return matches[1], nil
+}
+
+// sendGoogleSheetsWebhook envia dados para o webhook do Google Sheets
+func sendGoogleSheetsWebhook(webhookURL, sheetURL, symbol string, columns []interface{}, headers []string) error {
+	if webhookURL == "" || sheetURL == "" {
+		return fmt.Errorf("webhook URL ou sheet URL está vazia")
+	}
+
+	// Extrair ID da planilha
+	sheetID, err := extractSheetID(sheetURL)
+	if err != nil {
+		return fmt.Errorf("erro ao extrair ID da planilha: %w", err)
+	}
+
+	// Montar payload
+	payload := map[string]interface{}{
+		"sheet_id": sheetID,
+		"symbol":   symbol,
+		"columns":  columns,
+	}
+
+	// Adicionar headers apenas se fornecido
+	if len(headers) > 0 {
+		payload["headers"] = headers
+	}
+
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("erro ao serializar payload: %w", err)
+	}
+
+	resp, err := http.Post(webhookURL, "application/json", bytes.NewReader(jsonData))
+	if err != nil {
+		return fmt.Errorf("erro ao enviar requisição: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
 		return fmt.Errorf("status code: %d", resp.StatusCode)
 	}
 

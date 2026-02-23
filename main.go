@@ -155,6 +155,48 @@ func handleAddAccount(manager *AccountManager, scanner *bufio.Scanner) {
 		return
 	}
 
+	fmt.Print("Webhook URL Google Planilhas feito com google scripts (opcional, deixe em branco para não usar): ")
+	scanner.Scan()
+	webhookURLGoogleSheets := strings.TrimSpace(scanner.Text())
+	if webhookURLGoogleSheets == "cancelar" || webhookURLGoogleSheets == "0" {
+		return
+	}
+
+	var sheetURLGoogleSheets string
+	if webhookURLGoogleSheets != "" {
+		// Validar webhook URL
+		if !validateGoogleSheetsWebhookURL(webhookURLGoogleSheets) {
+			fmt.Println("Erro: Webhook URL do Google Planilhas inválida!")
+			fmt.Println("Formato esperado: https://script.google.com/macros/s/.../exec")
+			fmt.Println("\nPressione Enter para voltar ao menu principal...")
+			scanner.Scan()
+			return
+		}
+
+		fmt.Print("URL da planilha do Google para receber os dados (obrigatório se webhook do google planilhas foi preenchido): ")
+		scanner.Scan()
+		sheetURLGoogleSheets = strings.TrimSpace(scanner.Text())
+		if sheetURLGoogleSheets == "cancelar" || sheetURLGoogleSheets == "0" {
+			return
+		}
+
+		if sheetURLGoogleSheets == "" {
+			fmt.Println("Erro: URL da planilha do Google é obrigatória quando webhook URL é preenchida!")
+			fmt.Println("\nPressione Enter para voltar ao menu principal...")
+			scanner.Scan()
+			return
+		}
+
+		// Validar sheet URL
+		if !validateGoogleSheetsURL(sheetURLGoogleSheets) {
+			fmt.Println("Erro: URL da planilha do Google inválida!")
+			fmt.Println("Formato esperado: https://docs.google.com/spreadsheets/d/.../edit...")
+			fmt.Println("\nPressione Enter para voltar ao menu principal...")
+			scanner.Scan()
+			return
+		}
+	}
+
 	if nome == "" || apiKey == "" || apiSecret == "" {
 		fmt.Println("Erro: Nome, API Key e API Secret são obrigatórios!")
 		fmt.Println("\nPressione Enter para voltar ao menu principal...")
@@ -163,13 +205,15 @@ func handleAddAccount(manager *AccountManager, scanner *bufio.Scanner) {
 	}
 
 	account := &BybitAccount{
-		Name:               nome,
-		APIKey:             apiKey,
-		APISecret:          apiSecret,
-		WebhookURL:         webhookURL,
-		Active:             true,
-		MarkEveryoneOrder:  markEveryoneOrder,
-		MarkEveryoneWallet: markEveryoneWallet,
+		Name:                    nome,
+		APIKey:                  apiKey,
+		APISecret:               apiSecret,
+		WebhookURL:              webhookURL,
+		Active:                  true,
+		MarkEveryoneOrder:       markEveryoneOrder,
+		MarkEveryoneWallet:      markEveryoneWallet,
+		WebhookURLGoogleSheets:  webhookURLGoogleSheets,
+		SheetURLGoogleSheets:    sheetURLGoogleSheets,
 	}
 
 	if err := manager.AddAccount(account); err != nil {
@@ -207,6 +251,11 @@ func handleListAccounts(manager *AccountManager, wsManager *WebSocketManager, sc
 				fmt.Printf("   Webhook Discord: Configurado\n")
 			} else {
 				fmt.Printf("   Webhook Discord: Não configurado (notificações no terminal)\n")
+			}
+			if acc.WebhookURLGoogleSheets != "" && acc.SheetURLGoogleSheets != "" {
+				fmt.Printf("   Webhook Google Planilhas: Configurado\n")
+			} else {
+				fmt.Printf("   Webhook Google Planilhas: Não configurado\n")
 			}
 			fmt.Printf("   Status: %s\n", getStatusText(acc.Active))
 			fmt.Printf("   Monitoramento: %s\n", monitoringStatus)
@@ -423,11 +472,71 @@ func handleEditAccount(manager *AccountManager, wsManager *WebSocketManager, sca
 		newMarkEveryoneWallet = markEveryoneWalletInput == "sim" || markEveryoneWalletInput == "s"
 	}
 
+	currentWebhookURLGoogleSheets := account.WebhookURLGoogleSheets
+	if currentWebhookURLGoogleSheets == "" {
+		currentWebhookURLGoogleSheets = "(não configurado)"
+	}
+	fmt.Printf("\nWebhook URL Google Planilhas atual: %s\n", currentWebhookURLGoogleSheets)
+	fmt.Print("Novo Webhook URL Google Planilhas (pressione Enter para manter o atual, ou digite 'remover' para remover): ")
+	scanner.Scan()
+	newWebhookURLGoogleSheets := strings.TrimSpace(scanner.Text())
+	if newWebhookURLGoogleSheets == "cancelar" || newWebhookURLGoogleSheets == "0" {
+		return
+	}
+	if newWebhookURLGoogleSheets == "" {
+		newWebhookURLGoogleSheets = account.WebhookURLGoogleSheets
+	} else if newWebhookURLGoogleSheets == "remover" {
+		newWebhookURLGoogleSheets = ""
+	} else {
+		// Validar webhook URL
+		if !validateGoogleSheetsWebhookURL(newWebhookURLGoogleSheets) {
+			fmt.Println("Erro: Webhook URL do Google Planilhas inválida!")
+			fmt.Println("Formato esperado: https://script.google.com/macros/s/.../exec")
+			fmt.Println("\nPressione Enter para voltar ao menu principal...")
+			scanner.Scan()
+			return
+		}
+	}
+
+	currentSheetURLGoogleSheets := account.SheetURLGoogleSheets
+	if currentSheetURLGoogleSheets == "" {
+		currentSheetURLGoogleSheets = "(não configurado)"
+	}
+	fmt.Printf("\nURL da planilha do Google atual: %s\n", currentSheetURLGoogleSheets)
+	fmt.Print("Nova URL da planilha do Google (pressione Enter para manter o atual, ou digite 'remover' para remover): ")
+	scanner.Scan()
+	newSheetURLGoogleSheets := strings.TrimSpace(scanner.Text())
+	if newSheetURLGoogleSheets == "cancelar" || newSheetURLGoogleSheets == "0" {
+		return
+	}
+	if newSheetURLGoogleSheets == "" {
+		newSheetURLGoogleSheets = account.SheetURLGoogleSheets
+	} else if newSheetURLGoogleSheets == "remover" {
+		newSheetURLGoogleSheets = ""
+	} else {
+		// Validar sheet URL
+		if !validateGoogleSheetsURL(newSheetURLGoogleSheets) {
+			fmt.Println("Erro: URL da planilha do Google inválida!")
+			fmt.Println("Formato esperado: https://docs.google.com/spreadsheets/d/.../edit...")
+			fmt.Println("\nPressione Enter para voltar ao menu principal...")
+			scanner.Scan()
+			return
+		}
+	}
+
+	// Validar que se webhook URL foi preenchida, sheet URL também deve estar preenchida
+	if newWebhookURLGoogleSheets != "" && newSheetURLGoogleSheets == "" {
+		fmt.Println("Erro: URL da planilha do Google é obrigatória quando webhook URL do google planilhas é preenchida!")
+		fmt.Println("\nPressione Enter para voltar ao menu principal...")
+		scanner.Scan()
+		return
+	}
+
 	// Verificar se a conta está sendo monitorada antes de editar
 	wasMonitored := wsManager.IsConnectionActive(account.ID)
 
 	// Atualizar conta
-	if err := manager.UpdateAccount(account.ID, newName, newWebhook, newMarkEveryoneOrder, newMarkEveryoneWallet); err != nil {
+	if err := manager.UpdateAccount(account.ID, newName, newWebhook, newMarkEveryoneOrder, newMarkEveryoneWallet, newWebhookURLGoogleSheets, newSheetURLGoogleSheets); err != nil {
 		fmt.Printf("\nErro ao editar conta: %v\n", err)
 		fmt.Println("\nPressione Enter para voltar ao menu principal...")
 		scanner.Scan()
@@ -645,6 +754,11 @@ func handleViewMonitoredAccounts(wsManager *WebSocketManager, scanner *bufio.Sca
 				fmt.Printf("   Webhook Discord: Configurado\n")
 			} else {
 				fmt.Printf("   Webhook Discord: Não configurado (notificações no terminal)\n")
+			}
+			if acc.WebhookURLGoogleSheets != "" && acc.SheetURLGoogleSheets != "" {
+				fmt.Printf("   Webhook Google Planilhas: Configurado\n")
+			} else {
+				fmt.Printf("   Webhook Google Planilhas: Não configurado\n")
 			}
 			fmt.Printf("   Status: Monitorando\n")
 			fmt.Printf("   Marcar @everyone em ordens: %s\n", getBooleanText(acc.MarkEveryoneOrder))

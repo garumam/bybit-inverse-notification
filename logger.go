@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	maxLogLines = 1000
+	maxLogLines = 5000
 )
 
 // getBrasiliaTime retorna o horário atual no fuso horário de Brasília (UTC-3)
@@ -95,61 +95,85 @@ func getLogger(accountID int64, accountName string) (*Logger, error) {
 		lineCount:  0,
 	}
 
-	// Contar linhas existentes e manter apenas as últimas 1000
-	if err := logger.rotateIfNeeded(); err != nil {
+	// Contar linhas existentes no arquivo
+	if err := logger.countExistingLines(); err != nil {
 		file.Close()
-		return nil, fmt.Errorf("erro ao rotacionar log: %w", err)
+		return nil, fmt.Errorf("erro ao contar linhas do log: %w", err)
 	}
 
 	loggers[accountID] = logger
 	return logger, nil
 }
 
-func (l *Logger) rotateIfNeeded() error {
-	// Ler todas as linhas do arquivo
+// countExistingLines conta as linhas existentes no arquivo e atualiza lineCount
+func (l *Logger) countExistingLines() error {
+	// Reposicionar para o início do arquivo para contar
+	if _, err := l.file.Seek(0, 0); err != nil {
+		return err
+	}
+
 	scanner := bufio.NewScanner(l.file)
-	var lines []string
+	count := 0
 	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
+		count++
 	}
 	if err := scanner.Err(); err != nil {
 		return err
 	}
 
-	l.lineCount = len(lines)
+	l.lineCount = count
 
-	// Se exceder o limite, manter apenas as últimas 1000 linhas
-	if l.lineCount >= maxLogLines {
-		lines = lines[l.lineCount-maxLogLines:]
-		l.lineCount = len(lines)
+	// Reposicionar para o final do arquivo para continuar escrevendo
+	if _, err := l.file.Seek(0, 2); err != nil {
+		return err
+	}
 
-		// Reescrever arquivo com apenas as últimas linhas
-		l.file.Close()
-		
-		logsDir := getLogsDir()
-		logFileName := filepath.Join(logsDir, fmt.Sprintf("account_%d.log", l.accountID))
-		file, err := os.OpenFile(logFileName, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
-		if err != nil {
-			return err
-		}
+	return nil
+}
 
-		l.file = file
-		l.writer = bufio.NewWriter(file)
+// rotateLog rotaciona o arquivo de log quando atinge o limite
+// Renomeia o arquivo atual para _archive.log e cria um novo arquivo zerado
+func (l *Logger) rotateLog() error {
+	logsDir := getLogsDir()
+	currentLogFile := filepath.Join(logsDir, fmt.Sprintf("account_%d.log", l.accountID))
+	archiveLogFile := filepath.Join(logsDir, fmt.Sprintf("account_%d_archive.log", l.accountID))
 
-		for _, line := range lines {
-			if _, err := l.writer.WriteString(line + "\n"); err != nil {
-				return err
-			}
-		}
+	// Fechar arquivo e writer atuais
+	if l.writer != nil {
 		if err := l.writer.Flush(); err != nil {
 			return err
 		}
 	}
-
-	// Reposicionar para o final do arquivo
-	if _, err := l.file.Seek(0, 2); err != nil {
-		return err
+	if l.file != nil {
+		if err := l.file.Close(); err != nil {
+			return err
+		}
 	}
+
+	// Remover archive existente se houver
+	if _, err := os.Stat(archiveLogFile); err == nil {
+		if err := os.Remove(archiveLogFile); err != nil {
+			return fmt.Errorf("erro ao remover archive existente: %w", err)
+		}
+	}
+
+	// Renomear arquivo atual para archive
+	if _, err := os.Stat(currentLogFile); err == nil {
+		if err := os.Rename(currentLogFile, archiveLogFile); err != nil {
+			return fmt.Errorf("erro ao renomear arquivo para archive: %w", err)
+		}
+	}
+
+	// Criar novo arquivo zerado
+	file, err := os.OpenFile(currentLogFile, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("erro ao criar novo arquivo de log: %w", err)
+	}
+
+	// Atualizar referências do logger
+	l.file = file
+	l.writer = bufio.NewWriter(file)
+	l.lineCount = 0
 
 	return nil
 }
@@ -178,10 +202,10 @@ func (l *Logger) Log(format string, args ...interface{}) {
 
 	l.lineCount++
 
-	// Verificar se precisa rotacionar
+	// Verificar se precisa rotacionar (quando atingir exatamente 5000 linhas)
 	if l.lineCount >= maxLogLines {
-		if err := l.rotateIfNeeded(); err != nil {
-			// Log de erro silencioso
+		if err := l.rotateLog(); err != nil {
+			// Log de erro silencioso - continuar mesmo se falhar
 			return
 		}
 	}

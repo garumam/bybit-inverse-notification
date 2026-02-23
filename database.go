@@ -44,10 +44,14 @@ func (d *Database) initSchema() error {
 	createAccountsTable := `
 	CREATE TABLE IF NOT EXISTS bybit_accounts (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		name TEXT NOT NULL,
-		api_key TEXT NOT NULL,
-		api_secret TEXT NOT NULL,
-		webhook_url TEXT,
+		name TEXT NOT NULL DEFAULT '',
+		api_key TEXT NOT NULL DEFAULT '',
+		api_secret TEXT NOT NULL DEFAULT '',
+		webhook_url TEXT NOT NULL DEFAULT '',
+		webhook_url_google_sheets TEXT NOT NULL DEFAULT '',
+		sheet_url_google_sheets TEXT NOT NULL DEFAULT '',
+		mark_everyone_order INTEGER DEFAULT 0,
+		mark_everyone_wallet INTEGER DEFAULT 0,
 		active INTEGER DEFAULT 1,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);`
@@ -89,6 +93,14 @@ func (d *Database) initSchema() error {
 	}
 
 	if err := d.addColumnIfNotExists("bybit_accounts", "mark_everyone_wallet", "INTEGER DEFAULT 0"); err != nil {
+		return err
+	}
+
+	if err := d.addColumnIfNotExists("bybit_accounts", "webhook_url_google_sheets", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+
+	if err := d.addColumnIfNotExists("bybit_accounts", "sheet_url_google_sheets", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
 
