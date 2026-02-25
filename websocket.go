@@ -199,6 +199,17 @@ func getDisplayPrice(order OrderData) string {
 	return order.Price
 }
 
+// hasValidDisplayPrice retorna true se a ordem tem preço de exibição válido (> 0).
+// Usado para evitar notificações com preço zerado (ex: Market sem avgPrice).
+func hasValidDisplayPrice(order OrderData) bool {
+	s := getDisplayPrice(order)
+	if s == "" {
+		return false
+	}
+	p, err := strconv.ParseFloat(s, 64)
+	return err == nil && p != 0
+}
+
 func (wsm *WebSocketManager) StartConnection(accountID int64) error {
 	wsm.mu.Lock()
 	defer wsm.mu.Unlock()
@@ -1220,45 +1231,49 @@ func (wsm *WebSocketManager) processOrderBuffer(accountID int64, wsConn *WebSock
 				
 				// Comparar preços usando os valores corretos
 				if oldPriceStr != newPriceStr {
-					// Preço mudou - criar notificação especial
-					reducePrefix := ""
-					if order.ReduceOnly {
-						reducePrefix = "Reduce "
-					}
-					
-					var orderIcon string
-					if order.Side == "Buy" {
-						orderIcon = "🟢"
+					oldPrice, errOld := strconv.ParseFloat(oldPriceStr, 64)
+					newPrice, errNew := strconv.ParseFloat(newPriceStr, 64)
+					// Só notificar "ordem movida" se ambos os preços forem diferentes de 0
+					if errOld != nil || errNew != nil || oldPrice == 0 || newPrice == 0 {
+						// Salvar no banco abaixo; não marcar como movida
 					} else {
-						orderIcon = "🔴"
-					}
+						// Preço mudou - criar notificação especial
+						reducePrefix := ""
+						if order.ReduceOnly {
+							reducePrefix = "Reduce "
+						}
 
-					oldPrice, _ := strconv.ParseFloat(oldPriceStr, 64)
-					newPrice, _ := strconv.ParseFloat(newPriceStr, 64)
+						var orderIcon string
+						if order.Side == "Buy" {
+							orderIcon = "🟢"
+						} else {
+							orderIcon = "🔴"
+						}
 
-					qty, err := strconv.ParseFloat(order.Qty, 64)
-					if err != nil {
-						// Erro ao parsear quantidade - pular esta ordem
-						continue
-					}
+						qty, err := strconv.ParseFloat(order.Qty, 64)
+						if err != nil {
+							continue
+						}
 
-					messageText := fmt.Sprintf("📝 %s Ordem movida - %s %s%s %s\n   Preço: %.2f → %.2f (Qty: %.2f USD)",
-						orderIcon, order.Symbol, reducePrefix, order.Side, order.OrderType, oldPrice, newPrice, qty)
-					
-					wsm.sendNotificationWithType(wsConn, messageText, true, false)
-					
-					// Marcar como movida para não notificar novamente
-					movedOrders[order.OrderID] = true
-					
-					logger, _ := getLogger(accountID, wsConn.Account.Name)
-					if logger != nil {
-						logger.Log("[DEBUG] Ordem %s movida de %.2f para %.2f", order.OrderID, oldPrice, newPrice)
+						messageText := fmt.Sprintf("📝 %s Ordem movida - %s %s%s %s\n   Preço: %.2f → %.2f (Qty: %.2f USD)",
+							orderIcon, order.Symbol, reducePrefix, order.Side, order.OrderType, oldPrice, newPrice, qty)
+
+						wsm.sendNotificationWithType(wsConn, messageText, true, false)
+						movedOrders[order.OrderID] = true
+
+						logger, _ := getLogger(accountID, wsConn.Account.Name)
+						if logger != nil {
+							logger.Log("[DEBUG] Ordem %s movida de %.2f para %.2f", order.OrderID, oldPrice, newPrice)
+						}
 					}
 				}
 			}
 		}
 
-		if order.OrderStatus != "Filled" && order.OrderStatus != "PartiallyFilled" {
+		orderNewPriceStr := getDisplayPrice(order)
+		orderNewPrice, errNewOrder := strconv.ParseFloat(orderNewPriceStr, 64)
+
+		if order.OrderStatus != "Filled" && order.OrderStatus != "PartiallyFilled" && errNewOrder == nil && orderNewPrice != 0 {
 			// Salvar/atualizar ordem no banco
 			if err := wsm.accountManager.SaveOrder(order.OrderID, accountID, string(orderJSON)); err != nil {
 				logger, _ := getLogger(accountID, wsConn.Account.Name)
@@ -1445,25 +1460,37 @@ func (wsm *WebSocketManager) processCancelBuffer(accountID int64, wsConn *WebSoc
 	// Usar a conexão ativa
 	wsConn = activeConn
 
-	// Construir mensagem agrupada
-	var messageParts []string
-	messageParts = append(messageParts, fmt.Sprintf("❌ %d ordens canceladas:", len(orders)))
-
+	// Remover todas as ordens do banco (sempre)
 	for _, order := range orders {
-		reducePrefix := ""
-		if order.ReduceOnly {
-			reducePrefix = "Reduce "
-		}
-		messageParts = append(messageParts, fmt.Sprintf("  • %s %s%s %s @ %s",
-			order.Symbol, reducePrefix, order.Side, order.OrderType, order.Price))
-		
-		// Remover ordem do banco se existir
 		if err := wsm.accountManager.DeleteOrder(order.OrderID); err != nil {
 			logger, _ := getLogger(accountID, wsConn.Account.Name)
 			if logger != nil {
 				logger.Log("[DEBUG] Erro ao remover ordem %s do banco: %v", order.OrderID, err)
 			}
 		}
+	}
+
+	// Notificar apenas ordens com preço válido (> 0), para evitar "Market @ 0"
+	var ordersToNotify []OrderData
+	for _, order := range orders {
+		if hasValidDisplayPrice(order) {
+			ordersToNotify = append(ordersToNotify, order)
+		}
+	}
+	if len(ordersToNotify) == 0 {
+		return
+	}
+
+	// Construir mensagem agrupada
+	messageParts := []string{fmt.Sprintf("❌ %d ordens canceladas:", len(ordersToNotify))}
+	for _, order := range ordersToNotify {
+		reducePrefix := ""
+		if order.ReduceOnly {
+			reducePrefix = "Reduce "
+		}
+		displayPrice := getDisplayPrice(order)
+		messageParts = append(messageParts, fmt.Sprintf("  • %s %s%s %s @ %s",
+			order.Symbol, reducePrefix, order.Side, order.OrderType, displayPrice))
 	}
 
 	messageText := strings.Join(messageParts, "\n")
@@ -1501,9 +1528,8 @@ func (wsm *WebSocketManager) processStopOrder(wsConn *WebSocketConnection, order
 		// Stop existe, verificar se o triggerPrice mudou
 		var existingOrder OrderData
 		if err := json.Unmarshal([]byte(existingOrderJSON), &existingOrder); err == nil {
-			// Comparar triggerPrice
-			if existingOrder.TriggerPrice != order.TriggerPrice {
-				// TriggerPrice mudou - criar notificação especial
+			// Comparar triggerPrice; só notificar "stop movido" se triggerPrice != 0
+			if existingOrder.TriggerPrice != order.TriggerPrice && triggerPrice != 0 {
 				var stopIcon string
 				if order.Side == "Buy" {
 					stopIcon = "🟢"
@@ -1516,11 +1542,10 @@ func (wsm *WebSocketManager) processStopOrder(wsConn *WebSocketConnection, order
 
 				messageText := fmt.Sprintf("📝 %s Stop movido - %s %s%s %s\n   Preço: %.2f → %.2f (Qty: %.2f USD)",
 					stopIcon, order.Symbol, reducePrefix, order.Side, order.OrderType, oldPrice, newPrice, qty)
-				
+
 				wsm.sendNotificationWithType(wsConn, messageText, true, false)
-				
 				orderMoved = true
-				
+
 				logger, _ := getLogger(wsConn.AccountID, wsConn.Account.Name)
 				if logger != nil {
 					logger.Log("[DEBUG] Stop %s movido de %.2f para %.2f", order.OrderID, oldPrice, newPrice)
@@ -1533,7 +1558,7 @@ func (wsm *WebSocketManager) processStopOrder(wsConn *WebSocketConnection, order
 	orderJSON, err := json.Marshal(order)
 	if err == nil {
 		// Se a ordem está Filled ou PartiallyFilled, remover do banco e não processar
-		if order.OrderStatus != "Filled" && order.OrderStatus != "PartiallyFilled" {
+		if order.OrderStatus != "Filled" && order.OrderStatus != "PartiallyFilled" && triggerPrice != 0 {
 			if err := wsm.accountManager.SaveOrder(order.OrderID, wsConn.AccountID, string(orderJSON)); err != nil {
 				logger, _ := getLogger(wsConn.AccountID, wsConn.Account.Name)
 				if logger != nil {
@@ -1552,6 +1577,11 @@ func (wsm *WebSocketManager) processStopOrder(wsConn *WebSocketConnection, order
 
 	// Se a ordem foi notificada como movida, não enviar notificação normal
 	if orderMoved {
+		return
+	}
+
+	// Cancelar notificação se triggerPrice for 0
+	if triggerPrice == 0 {
 		return
 	}
 
@@ -1599,6 +1629,11 @@ func (wsm *WebSocketManager) processStopCancellation(wsConn *WebSocketConnection
 		if logger != nil {
 			logger.Log("[DEBUG] Erro ao remover stop %s do banco: %v", order.OrderID, err)
 		}
+	}
+
+	// Se triggerPrice for 0, cancelar notificação
+	if triggerPrice == 0 {
+		return
 	}
 
 	// Escolher ícone baseado no Side (Buy = verde, Sell = vermelho)
