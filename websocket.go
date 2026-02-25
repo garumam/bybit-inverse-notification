@@ -1813,7 +1813,7 @@ func (wsm *WebSocketManager) handleWalletMessage(wsConn *WebSocketConnection, wa
 		}
 		wsm.bufferMu.Unlock()
 
-		// Enviar webhook do Google Sheets se configurado
+		// Enviar webhook do Google Sheets se configurado (em goroutine para não bloquear a thread principal)
 		if wsConn.Account.WebhookURLGoogleSheets != "" && wsConn.Account.SheetURLGoogleSheets != "" {
 			// Obter posições do buffer para calcular valores
 			wsm.bufferMu.RLock()
@@ -1849,15 +1849,20 @@ func (wsm *WebSocketManager) handleWalletMessage(wsConn *WebSocketConnection, wa
 				return
 			}
 
-			// Processar cada Coin do walletData original (não mergeado)
-			for _, coinBalance := range walletData.Coin {
-				// Extrair moeda do símbolo para buscar posição
-				coin := coinBalance.Coin
+			// Montar lista de payloads para envio assíncrono (cópia dos dados para a goroutine)
+			var webhookPayloads []struct {
+				coin    string
+				columns []interface{}
+				headers []string
+			}
+			now := getBrasiliaTime()
+			dateTimeStr := now.Format("02/01/2006 15:04")
+			headers := []string{"data", "moeda", "total_moeda", "total_dolar", "total_protegido", "total_exposto", "total_long"}
 
-				// Tentar encontrar posição correspondente
+			for _, coinBalance := range walletData.Coin {
+				coin := coinBalance.Coin
 				var position *PositionData
 				for posSymbol, pos := range positions {
-					// Extrair moeda do símbolo
 					posCoin := posSymbol
 					if strings.HasSuffix(posSymbol, "USD") {
 						posCoin = posSymbol[:len(posSymbol)-3]
@@ -1866,39 +1871,21 @@ func (wsm *WebSocketManager) handleWalletMessage(wsConn *WebSocketConnection, wa
 					} else if strings.HasSuffix(posSymbol, "USDC") {
 						posCoin = posSymbol[:len(posSymbol)-4]
 					}
-
 					if posCoin == coin {
 						position = pos
 						break
 					}
 				}
 
-				// Calcular valores
-				equity, err := strconv.ParseFloat(coinBalance.Equity, 64)
-				if err != nil {
-					equity = 0
-				}
-
-				usdValue, err := strconv.ParseFloat(coinBalance.UsdValue, 64)
-				if err != nil {
-					usdValue = 0
-				}
-
+				equity, _ := strconv.ParseFloat(coinBalance.Equity, 64)
+				usdValue, _ := strconv.ParseFloat(coinBalance.UsdValue, 64)
 				var protecaoUSD, expostoUSD, longUSD float64
 				if position != nil {
 					longUSD, protecaoUSD, expostoUSD = calculatePositionValues(position, usdValue)
 				} else {
-					// Sem posição, valores são zero
-					protecaoUSD = 0
 					expostoUSD = usdValue
-					longUSD = 0
 				}
 
-				// Obter data/hora atual no horário de Brasília
-				now := getBrasiliaTime()
-				dateTimeStr := now.Format("02/01/2006 15:04")
-
-				// Montar columns
 				columns := []interface{}{
 					dateTimeStr,
 					coinBalance.Coin,
@@ -1908,31 +1895,25 @@ func (wsm *WebSocketManager) handleWalletMessage(wsConn *WebSocketConnection, wa
 					expostoUSD,
 					longUSD,
 				}
+				webhookPayloads = append(webhookPayloads, struct {
+					coin    string
+					columns []interface{}
+					headers []string
+				}{coin: coinBalance.Coin, columns: columns, headers: headers})
+			}
 
-				// Headers
-				headers := []string{
-					"data",
-					"moeda",
-					"total_moeda",
-					"total_dolar",
-					"total_protegido",
-					"total_exposto",
-					"total_long",
-				}
-
-				// Enviar webhook
-				if err := sendGoogleSheetsWebhook(
-					wsConn.Account.WebhookURLGoogleSheets,
-					wsConn.Account.SheetURLGoogleSheets,
-					coinBalance.Coin,
-					columns,
-					headers,
-				); err != nil {
-					if logger != nil {
-						logger.Log("Erro ao enviar webhook do Google Sheets para %s: %v", coinBalance.Coin, err)
+			// Enviar webhooks em goroutine para não bloquear o fluxo principal
+			webhookURL := wsConn.Account.WebhookURLGoogleSheets
+			sheetURL := wsConn.Account.SheetURLGoogleSheets
+			go func() {
+				for _, p := range webhookPayloads {
+					if err := sendGoogleSheetsWebhook(webhookURL, sheetURL, p.coin, p.columns, p.headers); err != nil {
+						if logger != nil {
+							logger.Log("Erro ao enviar webhook do Google Sheets para %s: %v", p.coin, err)
+						}
 					}
 				}
-			}
+			}()
 		}
 	}
 }
@@ -2226,16 +2207,17 @@ func (wsm *WebSocketManager) sendNotificationWithType(wsConn *WebSocketConnectio
 		now.Format("15:04"))
 	
 	if wsConn.Account.WebhookURL != "" {
-		// Enviar para Discord
+		// Enviar para Discord em goroutine para não bloquear o fluxo principal
 		// Discord remove quebras de linha no início, então precisamos ter conteúdo antes
+		webhookURL := wsConn.Account.WebhookURL
 		discordMsg := fmt.Sprintf("%s%s\n%s\n\n%s", everyoneTag, alertIcon, messageText, timeStamp)
-		if err := sendDiscordWebhook(wsConn.Account.WebhookURL, discordMsg); err != nil {
-			// Fallback para logger em caso de erro no webhook
-			if logger != nil {
-				logger.Log("Erro ao enviar webhook, notificação: %s", messageText)
+		go func() {
+			if err := sendDiscordWebhook(webhookURL, discordMsg); err != nil {
+				if logger != nil {
+					logger.Log("Erro ao enviar webhook, notificação: %s", messageText)
+				}
 			}
-		}
-		// Não logar quando enviado com sucesso para evitar logs desnecessários
+		}()
 	}
 	// Quando não há webhook, não fazer nada (não logar nem imprimir)
 }
