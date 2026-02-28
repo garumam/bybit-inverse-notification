@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"time"
+
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -75,6 +77,18 @@ func (d *Database) initSchema() error {
 		FOREIGN KEY (account_id) REFERENCES bybit_accounts(id) ON DELETE CASCADE
 	);`
 
+	// Tabela de última mensagem por tipo (wallet/position), uma linha por account_id + message_type + symbol
+	createLastMessageSnapshotsTable := `
+	CREATE TABLE IF NOT EXISTS last_message_snapshots (
+		account_id INTEGER NOT NULL,
+		message_type TEXT NOT NULL,
+		symbol TEXT NOT NULL,
+		message TEXT NOT NULL,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (account_id, message_type, symbol),
+		FOREIGN KEY (account_id) REFERENCES bybit_accounts(id) ON DELETE CASCADE
+	);`
+
 	if _, err := d.db.Exec(createAccountsTable); err != nil {
 		return err
 	}
@@ -84,6 +98,10 @@ func (d *Database) initSchema() error {
 	}
 
 	if _, err := d.db.Exec(createOrdersTable); err != nil {
+		return err
+	}
+
+	if _, err := d.db.Exec(createLastMessageSnapshotsTable); err != nil {
 		return err
 	}
 
@@ -104,11 +122,86 @@ func (d *Database) initSchema() error {
 		return err
 	}
 
+	if err := d.addColumnIfNotExists("bybit_accounts", "webhook_url_executions", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := d.addColumnIfNotExists("bybit_accounts", "mark_everyone_execution", "INTEGER DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := d.addColumnIfNotExists("bybit_accounts", "sheet_url_google_sheets_executions", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+
 	return nil
 }
 
 func (d *Database) GetDB() *sql.DB {
 	return d.db
+}
+
+// SaveLastMessageSnapshot grava ou atualiza a última mensagem (wallet ou position) por account_id, tipo e símbolo.
+func (d *Database) SaveLastMessageSnapshot(accountID int64, messageType, symbol, messageJSON string) error {
+	_, err := d.db.Exec(
+		`INSERT OR REPLACE INTO last_message_snapshots (account_id, message_type, symbol, message, updated_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+		accountID, messageType, symbol, messageJSON,
+	)
+	return err
+}
+
+// WalletSnapshotRow representa uma linha de snapshot de wallet retornada do banco.
+type WalletSnapshotRow struct {
+	Symbol    string
+	Message   string
+	UpdatedAt string
+}
+
+// GetWalletSnapshotsUpdatedSince retorna snapshots de wallet atualizados desde since (para a conta).
+func (d *Database) GetWalletSnapshotsUpdatedSince(accountID int64, since time.Time) ([]WalletSnapshotRow, error) {
+	sinceStr := since.UTC().Format("2006-01-02 15:04:05")
+	rows, err := d.db.Query(
+		`SELECT symbol, message, updated_at FROM last_message_snapshots WHERE account_id = ? AND message_type = 'wallet' AND updated_at >= ? ORDER BY updated_at DESC`,
+		accountID, sinceStr,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []WalletSnapshotRow
+	for rows.Next() {
+		var r WalletSnapshotRow
+		if err := rows.Scan(&r.Symbol, &r.Message, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		result = append(result, r)
+	}
+	return result, rows.Err()
+}
+
+// PositionSnapshotRow representa uma linha de snapshot de position.
+type PositionSnapshotRow struct {
+	Symbol  string
+	Message string
+}
+
+// GetPositionSnapshots retorna os snapshots de position da conta (uma linha por símbolo, a mais recente).
+func (d *Database) GetPositionSnapshots(accountID int64) ([]PositionSnapshotRow, error) {
+	rows, err := d.db.Query(
+		`SELECT symbol, message FROM last_message_snapshots WHERE account_id = ? AND message_type = 'position'`,
+		accountID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []PositionSnapshotRow
+	for rows.Next() {
+		var r PositionSnapshotRow
+		if err := rows.Scan(&r.Symbol, &r.Message); err != nil {
+			return nil, err
+		}
+		result = append(result, r)
+	}
+	return result, rows.Err()
 }
 
 // addColumnIfNotExists verifica se uma coluna existe na tabela e a adiciona se não existir

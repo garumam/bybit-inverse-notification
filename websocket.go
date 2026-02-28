@@ -25,15 +25,22 @@ const (
 )
 
 type WebSocketManager struct {
-	accountManager *AccountManager
-	db             *Database
-	connections    map[int64]*WebSocketConnection
-	mu             sync.RWMutex
-	// Buffers para agrupamento de mensagens
-	orderBuffers    map[int64]*OrderBuffer
-	cancelBuffers   map[int64]*CancelBuffer
-	executionBuffers map[int64]*ExecutionBuffer
-	bufferMu        sync.RWMutex
+	accountManager            *AccountManager
+	db                        *Database
+	connections               map[int64]*WebSocketConnection
+	mu                        sync.RWMutex
+	orderBuffers              map[int64]*OrderBuffer
+	cancelBuffers             map[int64]*CancelBuffer
+	executionBuffers          map[int64]*ExecutionBuffer
+	executionNotificationBuffers map[int64]*ExecutionNotificationBuffer
+	bufferMu                  sync.RWMutex
+}
+
+type ExecutionNotificationBuffer struct {
+	executions []ExecutionData
+	timer      *time.Timer
+	mu         sync.Mutex
+	accountID  int64
 }
 
 type OrderBuffer struct {
@@ -51,9 +58,8 @@ type CancelBuffer struct {
 }
 
 type ExecutionBuffer struct {
-	lastWallet   *WalletData
-	positions    map[string]*PositionData // Mapa por símbolo (ex: BTCUSD)
-	timer        *time.Timer
+	discordTimer *time.Timer // 15 min: notificação Discord (wallet)
+	sheetsTimer  *time.Timer // 2 min: notificação Google Sheets
 	mu           sync.Mutex
 	accountID    int64
 }
@@ -122,6 +128,7 @@ type ExecutionData struct {
 	OrderType     string `json:"orderType"`
 	CreateType    string `json:"createType"`
 	MarkPrice     string `json:"markPrice"`
+	ExecTime      string `json:"execTime"` // timestamp da execução em ms (API Bybit)
 }
 
 type PositionData struct {
@@ -173,12 +180,13 @@ type OrderData struct {
 
 func NewWebSocketManager(db *Database, accountManager *AccountManager) *WebSocketManager {
 	return &WebSocketManager{
-		accountManager:   accountManager,
-		db:               db,
-		connections:      make(map[int64]*WebSocketConnection),
-		orderBuffers:     make(map[int64]*OrderBuffer),
-		cancelBuffers:    make(map[int64]*CancelBuffer),
-		executionBuffers: make(map[int64]*ExecutionBuffer),
+		accountManager:               accountManager,
+		db:                           db,
+		connections:                  make(map[int64]*WebSocketConnection),
+		orderBuffers:                 make(map[int64]*OrderBuffer),
+		cancelBuffers:                make(map[int64]*CancelBuffer),
+		executionBuffers:             make(map[int64]*ExecutionBuffer),
+		executionNotificationBuffers: make(map[int64]*ExecutionNotificationBuffer),
 	}
 }
 
@@ -313,10 +321,23 @@ func (wsm *WebSocketManager) StopConnection(accountID int64) {
 		delete(wsm.cancelBuffers, accountID)
 	}
 	if executionBuffer, exists := wsm.executionBuffers[accountID]; exists {
-		if executionBuffer.timer != nil {
-			executionBuffer.timer.Stop()
+		executionBuffer.mu.Lock()
+		if executionBuffer.discordTimer != nil {
+			executionBuffer.discordTimer.Stop()
 		}
+		if executionBuffer.sheetsTimer != nil {
+			executionBuffer.sheetsTimer.Stop()
+		}
+		executionBuffer.mu.Unlock()
 		delete(wsm.executionBuffers, accountID)
+	}
+	if execNotifBuffer, exists := wsm.executionNotificationBuffers[accountID]; exists {
+		execNotifBuffer.mu.Lock()
+		if execNotifBuffer.timer != nil {
+			execNotifBuffer.timer.Stop()
+		}
+		execNotifBuffer.mu.Unlock()
+		delete(wsm.executionNotificationBuffers, accountID)
 	}
 	wsm.bufferMu.Unlock()
 
@@ -1013,6 +1034,15 @@ func (wsm *WebSocketManager) handleOrderMessage(wsConn *WebSocketConnection, ord
 						isLimitMoved = true
 					}
 				}
+
+				if !isLimitMoved {
+					// Remover do banco se existir
+					if err := wsm.accountManager.DeleteOrder(orderData.OrderID); err != nil {
+						if logger != nil {
+							logger.Log("[DEBUG] Erro ao remover ordem preenchida %s do banco: %v", orderData.OrderID, err)
+						}
+					}
+				}
 			}
 		}
 
@@ -1255,8 +1285,8 @@ func (wsm *WebSocketManager) processOrderBuffer(accountID int64, wsConn *WebSock
 							continue
 						}
 
-						messageText := fmt.Sprintf("📝 %s Ordem movida - %s %s%s %s\n   Preço: %.2f → %.2f (Qty: %.2f USD)",
-							orderIcon, order.Symbol, reducePrefix, order.Side, order.OrderType, oldPrice, newPrice, qty)
+						messageText := fmt.Sprintf("📝 %s Ordem movida - %s %s%s %s\n   Preço: %s → %s (Qty: %s USD)",
+							orderIcon, order.Symbol, reducePrefix, order.Side, order.OrderType, formatPriceCoin(oldPrice), formatPriceCoin(newPrice), formatPriceCoin(qty))
 
 						wsm.sendNotificationWithType(wsConn, messageText, true, false)
 						movedOrders[order.OrderID] = true
@@ -1273,7 +1303,7 @@ func (wsm *WebSocketManager) processOrderBuffer(accountID int64, wsConn *WebSock
 		orderNewPriceStr := getDisplayPrice(order)
 		orderNewPrice, errNewOrder := strconv.ParseFloat(orderNewPriceStr, 64)
 
-		if order.OrderStatus != "Filled" && order.OrderStatus != "PartiallyFilled" && errNewOrder == nil && orderNewPrice != 0 {
+		if order.OrderType != "Market" && order.OrderStatus != "Filled" && order.OrderStatus != "PartiallyFilled" && errNewOrder == nil && orderNewPrice != 0 {
 			// Salvar/atualizar ordem no banco
 			if err := wsm.accountManager.SaveOrder(order.OrderID, accountID, string(orderJSON)); err != nil {
 				logger, _ := getLogger(accountID, wsConn.Account.Name)
@@ -1375,19 +1405,19 @@ func (wsm *WebSocketManager) processOrderBuffer(accountID int64, wsConn *WebSock
 		var messageText string
 		if len(groupOrders) == 1 {
 			// Uma única ordem
-			messageText = fmt.Sprintf("%s Nova ordem aberta - %s %s%s %s @ %s (Qty: %.2f USD)",
-				orderIcon, firstOrder.Symbol, reducePrefix, firstOrder.Side, firstOrder.OrderType, displayPrice, totalQty)
+			messageText = fmt.Sprintf("%s Nova ordem aberta - %s %s%s %s @ %s (Qty: %s USD)",
+				orderIcon, firstOrder.Symbol, reducePrefix, firstOrder.Side, firstOrder.OrderType, displayPrice, formatPriceCoin(totalQty))
 		} else {
 			// Múltiplas ordens agrupadas (scale orders)
 			if minPrice == maxPrice {
 				// Todas no mesmo preço
-				messageText = fmt.Sprintf("%s %d ordens %s%s %s agrupadas - %s @ %s (Qty Total: %.2f USD)",
-					orderIcon, len(groupOrders), reducePrefix, firstOrder.Side, firstOrder.OrderType, firstOrder.Symbol, displayPrice, totalQty)
+				messageText = fmt.Sprintf("%s %d ordens %s%s %s agrupadas - %s @ %s (Qty Total: %s USD)",
+					orderIcon, len(groupOrders), reducePrefix, firstOrder.Side, firstOrder.OrderType, firstOrder.Symbol, displayPrice, formatPriceCoin(totalQty))
 			} else {
 				// Range de preços
-				messageText = fmt.Sprintf("%s %d ordens %s%s %s agrupadas - %s\n   Range: %.2f até %.2f\n   Qty Total: %.2f USD",
+				messageText = fmt.Sprintf("%s %d ordens %s%s %s agrupadas - %s\n   Range: %s até %s\n   Qty Total: %s USD",
 					orderIcon, len(groupOrders), reducePrefix, firstOrder.Side, firstOrder.OrderType, firstOrder.Symbol,
-					minPrice, maxPrice, totalQty)
+					formatPriceCoin(minPrice), formatPriceCoin(maxPrice), formatPriceCoin(totalQty))
 			}
 		}
 
@@ -1540,8 +1570,8 @@ func (wsm *WebSocketManager) processStopOrder(wsConn *WebSocketConnection, order
 				oldPrice, _ := strconv.ParseFloat(existingOrder.TriggerPrice, 64)
 				newPrice, _ := strconv.ParseFloat(order.TriggerPrice, 64)
 
-				messageText := fmt.Sprintf("📝 %s Stop movido - %s %s%s %s\n   Preço: %.2f → %.2f (Qty: %.2f USD)",
-					stopIcon, order.Symbol, reducePrefix, order.Side, order.OrderType, oldPrice, newPrice, qty)
+				messageText := fmt.Sprintf("📝 %s Stop movido - %s %s%s %s\n   Preço: %s → %s (Qty: %s USD)",
+					stopIcon, order.Symbol, reducePrefix, order.Side, order.OrderType, formatPriceCoin(oldPrice), formatPriceCoin(newPrice), formatPriceCoin(qty))
 
 				wsm.sendNotificationWithType(wsConn, messageText, true, false)
 				orderMoved = true
@@ -1594,8 +1624,8 @@ func (wsm *WebSocketManager) processStopOrder(wsConn *WebSocketConnection, order
 	}
 
 	// Formatar mensagem do stop
-	messageText := fmt.Sprintf("%s Stop %s%s %s - %s @ %.2f (Qty: %.2f USD)",
-		stopIcon, reducePrefix, order.Side, order.OrderType, order.Symbol, triggerPrice, qty)
+	messageText := fmt.Sprintf("%s Stop %s%s %s - %s @ %s (Qty: %s USD)",
+		stopIcon, reducePrefix, order.Side, order.OrderType, order.Symbol, formatPriceCoin(triggerPrice), formatPriceCoin(qty))
 
 	// Enviar notificação imediatamente (ordem)
 	wsm.sendNotificationWithType(wsConn, messageText, true, false)
@@ -1645,8 +1675,8 @@ func (wsm *WebSocketManager) processStopCancellation(wsConn *WebSocketConnection
 	}
 
 	// Formatar mensagem do cancelamento de stop
-	messageText := fmt.Sprintf("❌ %s Stop %s%s %s **CANCELADO** - %s @ %.2f (Qty: %.2f USD)",
-		stopIcon, reducePrefix, order.Side, order.OrderType, order.Symbol, triggerPrice, qty)
+	messageText := fmt.Sprintf("❌ %s Stop %s%s %s **CANCELADO** - %s @ %s (Qty: %s USD)",
+		stopIcon, reducePrefix, order.Side, order.OrderType, order.Symbol, formatPriceCoin(triggerPrice), formatPriceCoin(qty))
 
 	// Enviar notificação imediatamente (ordem)
 	wsm.sendNotificationWithType(wsConn, messageText, true, false)
@@ -1699,12 +1729,16 @@ func (wsm *WebSocketManager) handleExecutionMessage(wsConn *WebSocketConnection,
 		}
 
 		if logger != nil {
-			logger.Log("[DEBUG] Processando execução - Symbol: %s, Side: %s, ExecPrice: %s",
-				execData.Symbol, execData.Side, execData.ExecPrice)
+			jsonData, _ := json.Marshal(execData)
+
+			logger.Log("[DEBUG] Processando execução - Symbol: %s, Side: %s, ExecPrice: %s | JSON: %s",
+				execData.Symbol, execData.Side, execData.ExecPrice, string(jsonData))
 		}
 
 		// Adicionar ao buffer de execution (inicia/reseta timer de 15 minutos)
 		wsm.addExecutionToBuffer(wsConn.AccountID, wsConn)
+		// Adicionar ao buffer de notificação de execuções (5s: Discord + Google Sheets)
+		wsm.addExecutionToNotificationBuffer(wsConn.AccountID, execData, wsConn)
 	}
 }
 
@@ -1742,23 +1776,12 @@ func (wsm *WebSocketManager) handlePositionMessage(wsConn *WebSocketConnection, 
 			continue
 		}
 
-		// Atualizar posição por símbolo no buffer de execution (se existir)
-		wsm.bufferMu.Lock()
-		if buffer, exists := wsm.executionBuffers[wsConn.AccountID]; exists {
-			buffer.mu.Lock()
-			// Inicializar mapa se necessário
-			if buffer.positions == nil {
-				buffer.positions = make(map[string]*PositionData)
-			}
-			// Criar cópia da posição e armazenar por símbolo
-			posCopy := posData
-			buffer.positions[posData.Symbol] = &posCopy
-			buffer.mu.Unlock()
-			if logger != nil {
-				logger.Log("[DEBUG] Posição atualizada no buffer para símbolo: %s", posData.Symbol)
+		// Persistir última mensagem de position no banco (logo após validar)
+		if jsonData, err := json.Marshal(posData); err == nil {
+			if err := wsm.db.SaveLastMessageSnapshot(wsConn.AccountID, "position", posData.Symbol, string(jsonData)); err != nil && logger != nil {
+				logger.Log("Erro ao salvar snapshot de position no banco: %v", err)
 			}
 		}
-		wsm.bufferMu.Unlock()
 	}
 }
 
@@ -1796,159 +1819,20 @@ func (wsm *WebSocketManager) handleWalletMessage(wsConn *WebSocketConnection, wa
 			continue
 		}
 
-		// Atualizar último wallet no buffer de execution (se existir)
-		wsm.bufferMu.Lock()
-		if buffer, exists := wsm.executionBuffers[wsConn.AccountID]; exists {
-			buffer.mu.Lock()
-			// Criar cópia do wallet
+		// Persistir última mensagem de wallet no banco: uma linha por Coin (logo após validar)
+		for _, coin := range walletData.Coin {
 			walletCopy := walletData
-			
-			// Se já existe uma wallet no buffer, fazer merge das coins
-			if buffer.lastWallet != nil {
-				// Criar mapa das coins novas (por nome da coin) para busca rápida
-				newCoinsMap := make(map[string]CoinBalance)
-				for _, coin := range walletData.Coin {
-					newCoinsMap[coin.Coin] = coin
+			walletCopy.Coin = []CoinBalance{coin}
+			if jsonData, err := json.Marshal(walletCopy); err == nil {
+				if err := wsm.db.SaveLastMessageSnapshot(wsConn.AccountID, "wallet", coin.Coin, string(jsonData)); err != nil && logger != nil {
+					logger.Log("Erro ao salvar snapshot de wallet no banco: %v", err)
 				}
-				
-				// Criar slice para o resultado do merge
-				mergedCoins := make([]CoinBalance, 0)
-				
-				// Primeiro, adicionar coins antigas que não existem nas novas
-				for _, oldCoin := range buffer.lastWallet.Coin {
-					if _, exists := newCoinsMap[oldCoin.Coin]; !exists {
-						mergedCoins = append(mergedCoins, oldCoin)
-					}
-				}
-				
-				// Depois, adicionar todas as coins novas (que sobrescrevem as antigas)
-				for _, newCoin := range walletData.Coin {
-					mergedCoins = append(mergedCoins, newCoin)
-				}
-				
-				// Atualizar o array de coins no walletCopy com o resultado do merge
-				walletCopy.Coin = mergedCoins
-				
-				if logger != nil {
-					logger.Log("[DEBUG] Wallet mesclado: %d coins antigas mantidas, %d coins novas adicionadas", 
-						len(buffer.lastWallet.Coin)-len(walletData.Coin), len(walletData.Coin))
-				}
-			} else {
-				if logger != nil {
-					logger.Log("[DEBUG] Primeira wallet adicionada ao buffer")
-				}
-			}
-			
-			buffer.lastWallet = &walletCopy
-			buffer.mu.Unlock()
-			if logger != nil {
-				jsonData, _ := json.Marshal(walletCopy)
-				logger.Log("[DEBUG] Último wallet atualizado no buffer | JSON: %s", string(jsonData))
 			}
 		}
-		wsm.bufferMu.Unlock()
 
-		// Enviar webhook do Google Sheets se configurado (em goroutine para não bloquear a thread principal)
+		// Agendar notificação Google Sheets em 2 minutos (dados lidos do banco na hora)
 		if wsConn.Account.WebhookURLGoogleSheets != "" && wsConn.Account.SheetURLGoogleSheets != "" {
-			// Obter posições do buffer para calcular valores
-			wsm.bufferMu.RLock()
-			var positions map[string]*PositionData
-			if buffer, exists := wsm.executionBuffers[wsConn.AccountID]; exists {
-				buffer.mu.Lock()
-				if buffer.positions != nil {
-					positions = make(map[string]*PositionData)
-					for symbol, pos := range buffer.positions {
-						positions[symbol] = pos
-					}
-				}
-				buffer.mu.Unlock()
-			}
-			wsm.bufferMu.RUnlock()
-
-			// Função auxiliar para calcular proteção de uma posição (mesma lógica do processExecutionBuffer)
-			calculatePositionValues := func(position *PositionData, totalEquityCoin float64) (longUSD, protecaoUSD, expostoUSD float64) {
-				size, err := strconv.ParseFloat(position.Size, 64)
-				if err != nil {
-					size = 0
-				}
-
-				if position.Side == "Sell" {
-					protecaoUSD = size
-					longUSD = 0
-				} else {
-					protecaoUSD = 0
-					longUSD = size
-				}
-
-				expostoUSD = totalEquityCoin - size
-				return
-			}
-
-			// Montar lista de payloads para envio assíncrono (cópia dos dados para a goroutine)
-			var webhookPayloads []struct {
-				coin    string
-				columns []interface{}
-				headers []string
-			}
-			now := getBrasiliaTime()
-			dateTimeStr := now.Format("02/01/2006 15:04")
-			headers := []string{"data", "moeda", "total_moeda", "total_dolar", "total_protegido", "total_exposto", "total_long"}
-
-			for _, coinBalance := range walletData.Coin {
-				coin := coinBalance.Coin
-				var position *PositionData
-				for posSymbol, pos := range positions {
-					posCoin := posSymbol
-					if strings.HasSuffix(posSymbol, "USD") {
-						posCoin = posSymbol[:len(posSymbol)-3]
-					} else if strings.HasSuffix(posSymbol, "USDT") {
-						posCoin = posSymbol[:len(posSymbol)-4]
-					} else if strings.HasSuffix(posSymbol, "USDC") {
-						posCoin = posSymbol[:len(posSymbol)-4]
-					}
-					if posCoin == coin {
-						position = pos
-						break
-					}
-				}
-
-				equity, _ := strconv.ParseFloat(coinBalance.Equity, 64)
-				usdValue, _ := strconv.ParseFloat(coinBalance.UsdValue, 64)
-				var protecaoUSD, expostoUSD, longUSD float64
-				if position != nil {
-					longUSD, protecaoUSD, expostoUSD = calculatePositionValues(position, usdValue)
-				} else {
-					expostoUSD = usdValue
-				}
-
-				columns := []interface{}{
-					dateTimeStr,
-					coinBalance.Coin,
-					equity,
-					usdValue,
-					protecaoUSD,
-					expostoUSD,
-					longUSD,
-				}
-				webhookPayloads = append(webhookPayloads, struct {
-					coin    string
-					columns []interface{}
-					headers []string
-				}{coin: coinBalance.Coin, columns: columns, headers: headers})
-			}
-
-			// Enviar webhooks em goroutine para não bloquear o fluxo principal
-			webhookURL := wsConn.Account.WebhookURLGoogleSheets
-			sheetURL := wsConn.Account.SheetURLGoogleSheets
-			go func() {
-				for _, p := range webhookPayloads {
-					if err := sendGoogleSheetsWebhook(webhookURL, sheetURL, p.coin, p.columns, p.headers); err != nil {
-						if logger != nil {
-							logger.Log("Erro ao enviar webhook do Google Sheets para %s: %v", p.coin, err)
-						}
-					}
-				}
-			}()
+			wsm.resetSheetsTimer(wsConn.AccountID, wsConn)
 		}
 	}
 }
@@ -1957,10 +1841,7 @@ func (wsm *WebSocketManager) addExecutionToBuffer(accountID int64, wsConn *WebSo
 	wsm.bufferMu.Lock()
 	buffer, exists := wsm.executionBuffers[accountID]
 	if !exists {
-		buffer = &ExecutionBuffer{
-			accountID: accountID,
-			positions: make(map[string]*PositionData),
-		}
+		buffer = &ExecutionBuffer{accountID: accountID}
 		wsm.executionBuffers[accountID] = buffer
 	}
 	wsm.bufferMu.Unlock()
@@ -1968,18 +1849,10 @@ func (wsm *WebSocketManager) addExecutionToBuffer(accountID int64, wsConn *WebSo
 	buffer.mu.Lock()
 	defer buffer.mu.Unlock()
 
-	// Garantir que o mapa de posições está inicializado
-	if buffer.positions == nil {
-		buffer.positions = make(map[string]*PositionData)
+	if buffer.discordTimer != nil {
+		buffer.discordTimer.Stop()
 	}
-
-	// Se já existe timer, resetar para mais 15 minutos
-	if buffer.timer != nil {
-		buffer.timer.Stop()
-	}
-
-	// Iniciar/resetar timer de 15 minutos
-	buffer.timer = time.AfterFunc(15*time.Minute, func() {
+	buffer.discordTimer = time.AfterFunc(15*time.Minute, func() {
 		defer func() {
 			if r := recover(); r != nil {
 				fmt.Fprintf(os.Stderr, "[PANIC] processExecutionBuffer (timer) para conta %d: %v\n", accountID, r)
@@ -1989,8 +1862,90 @@ func (wsm *WebSocketManager) addExecutionToBuffer(accountID int64, wsConn *WebSo
 	})
 	logger, _ := getLogger(accountID, wsConn.Account.Name)
 	if logger != nil {
-		logger.Log("[DEBUG] Execução recebida, iniciando/resetando timer de 15 minutos")
+		logger.Log("[DEBUG] Execução recebida, iniciando/resetando timer de 15 minutos para Discord")
 	}
+}
+
+func (wsm *WebSocketManager) resetSheetsTimer(accountID int64, wsConn *WebSocketConnection) {
+	wsm.bufferMu.Lock()
+	buffer, exists := wsm.executionBuffers[accountID]
+	if !exists {
+		buffer = &ExecutionBuffer{accountID: accountID}
+		wsm.executionBuffers[accountID] = buffer
+	}
+	wsm.bufferMu.Unlock()
+
+	buffer.mu.Lock()
+	defer buffer.mu.Unlock()
+
+	if buffer.sheetsTimer != nil {
+		buffer.sheetsTimer.Stop()
+	}
+	buffer.sheetsTimer = time.AfterFunc(2*time.Minute, func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Fprintf(os.Stderr, "[PANIC] processSheetsNotification (timer) para conta %d: %v\n", accountID, r)
+			}
+		}()
+		wsm.processSheetsNotification(accountID)
+	})
+}
+
+func (wsm *WebSocketManager) addExecutionToNotificationBuffer(accountID int64, exec ExecutionData, wsConn *WebSocketConnection) {
+	wsm.bufferMu.Lock()
+	buf, exists := wsm.executionNotificationBuffers[accountID]
+	if !exists {
+		buf = &ExecutionNotificationBuffer{accountID: accountID}
+		wsm.executionNotificationBuffers[accountID] = buf
+	}
+	wsm.bufferMu.Unlock()
+
+	buf.mu.Lock()
+	defer buf.mu.Unlock()
+
+	if buf.timer != nil {
+		buf.timer.Stop()
+	}
+	buf.executions = append(buf.executions, exec)
+	buf.timer = time.AfterFunc(5*time.Second, func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Fprintf(os.Stderr, "[PANIC] flushExecutionNotificationBuffer (timer) para conta %d: %v\n", accountID, r)
+			}
+		}()
+		wsm.flushExecutionNotificationBuffer(accountID)
+	})
+}
+
+// mergeWalletSnapshotRows usa a linha mais recente (primeira) como base e junta as Coin das demais.
+// As linhas devem vir ordenadas por updated_at DESC.
+func mergeWalletSnapshotRows(rows []WalletSnapshotRow) *WalletData {
+	if len(rows) == 0 {
+		return nil
+	}
+	var base WalletData
+	if err := json.Unmarshal([]byte(rows[0].Message), &base); err != nil {
+		return nil
+	}
+	hasSymbol := func(w *WalletData, symbol string) bool {
+		for _, c := range w.Coin {
+			if c.Coin == symbol {
+				return true
+			}
+		}
+		return false
+	}
+	for i := 1; i < len(rows); i++ {
+		var w WalletData
+		if err := json.Unmarshal([]byte(rows[i].Message), &w); err != nil || len(w.Coin) == 0 {
+			continue
+		}
+		c := w.Coin[0]
+		if !hasSymbol(&base, c.Coin) {
+			base.Coin = append(base.Coin, c)
+		}
+	}
+	return &base
 }
 
 func (wsm *WebSocketManager) processExecutionBuffer(accountID int64, wsConn *WebSocketConnection) {
@@ -2022,34 +1977,31 @@ func (wsm *WebSocketManager) processExecutionBuffer(accountID int64, wsConn *Web
 	activeConn := conn
 	wsm.mu.RUnlock()
 
-	wsm.bufferMu.Lock()
-	buffer, exists := wsm.executionBuffers[accountID]
-	if !exists {
-		wsm.bufferMu.Unlock()
-		return
-	}
-
-	buffer.mu.Lock()
-	lastWallet := buffer.lastWallet
-	positions := make(map[string]*PositionData)
-	// Copiar posições
-	if buffer.positions != nil {
-		for symbol, pos := range buffer.positions {
-			positions[symbol] = pos
-		}
-	}
-	buffer.mu.Unlock()
-
-	// Não remover o buffer ainda, apenas processar
-	wsm.bufferMu.Unlock()
-
-	// Usar a conexão ativa
 	wsConn = activeConn
 
-	// Verificar se temos wallet
-	if lastWallet == nil {
-		// Nenhum wallet disponível - não processar
+	// Buscar wallets atualizadas nos últimos 17 minutos no banco
+	sinceWallet := time.Now().Add(-17 * time.Minute)
+	walletRows, err := wsm.db.GetWalletSnapshotsUpdatedSince(accountID, sinceWallet)
+	if err != nil || len(walletRows) == 0 {
 		return
+	}
+
+	lastWallet := mergeWalletSnapshotRows(walletRows)
+	if lastWallet == nil {
+		return
+	}
+
+	// Buscar posições no banco (referentes às coins da wallet)
+	positionRows, err := wsm.db.GetPositionSnapshots(accountID)
+	if err != nil {
+		return
+	}
+	positions := make(map[string]*PositionData)
+	for _, row := range positionRows {
+		var pos PositionData
+		if err := json.Unmarshal([]byte(row.Message), &pos); err == nil {
+			positions[row.Symbol] = &pos
+		}
 	}
 
 	// Obter valor total da carteira do wallet
@@ -2142,15 +2094,15 @@ func (wsm *WebSocketManager) processExecutionBuffer(accountID int64, wsConn *Web
 		// Criar mensagem da moeda (para usar no else se necessário)
 		var coinMsgParts []string
 		coinMsgParts = append(coinMsgParts, fmt.Sprintf("📌 %s (%s):", coin, symbol))
-		coinMsgParts = append(coinMsgParts, fmt.Sprintf("  💰 Total: $%.2f USD", totalEquityPerCoin))
-		coinMsgParts = append(coinMsgParts, fmt.Sprintf("  🛡️ Protegido: $%.2f USD", protecaoPosUSD))
+		coinMsgParts = append(coinMsgParts, fmt.Sprintf("  💰 Total: $%s USD", formatPriceCoin(totalEquityPerCoin)))
+		coinMsgParts = append(coinMsgParts, fmt.Sprintf("  🛡️ Protegido: $%s USD", formatPriceCoin(protecaoPosUSD)))
 		if longPosUSD > 0 {
-			coinMsgParts = append(coinMsgParts, fmt.Sprintf("  📈 Posição Long: $%.2f USD", longPosUSD))
+			coinMsgParts = append(coinMsgParts, fmt.Sprintf("  📈 Posição Long: $%s USD", formatPriceCoin(longPosUSD)))
 		}
-		coinMsgParts = append(coinMsgParts, fmt.Sprintf("  ⚠️ Exposto: $%.2f USD", expostoPosUSD))
-		coinMsgParts = append(coinMsgParts, fmt.Sprintf("  📈 %% Protegida: %.2f%%", percentProtegidaPos))
+		coinMsgParts = append(coinMsgParts, fmt.Sprintf("  ⚠️ Exposto: $%s USD", formatPriceCoin(expostoPosUSD)))
+		coinMsgParts = append(coinMsgParts, fmt.Sprintf("  📈 %% Protegida: %s%%", formatPriceCoin(percentProtegidaPos)))
 		if longPosUSD > 0 {
-			coinMsgParts = append(coinMsgParts, fmt.Sprintf("  📊 %% Longada: %.2f%%", percentLongadaPos))
+			coinMsgParts = append(coinMsgParts, fmt.Sprintf("  📊 %% Longada: %s%%", formatPriceCoin(percentLongadaPos)))
 		}
 		coinMsgParts = append(coinMsgParts, "")
 		coinMessages = append(coinMessages, strings.Join(coinMsgParts, "\n"))
@@ -2166,19 +2118,19 @@ func (wsm *WebSocketManager) processExecutionBuffer(accountID int64, wsConn *Web
 	// retornar o resumo geral da carteira apenas se tiver mais de uma posição válida ou nenhuma posição válida
 	if totalValidPositions != 1 {
 		messageParts = append(messageParts, "📊 Resumo Geral:")
-		messageParts = append(messageParts, fmt.Sprintf("  💰 Carteira Total: $%.2f USD", totalEquity))
-		messageParts = append(messageParts, fmt.Sprintf("  🛡️ Proteção Total: $%.2f USD", totalProtecaoUSD))
+		messageParts = append(messageParts, fmt.Sprintf("  💰 Carteira Total: $%s USD", formatPriceCoin(totalEquity)))
+		messageParts = append(messageParts, fmt.Sprintf("  🛡️ Proteção Total: $%s USD", formatPriceCoin(totalProtecaoUSD)))
 		if totalLongUSD > 0 {
-			messageParts = append(messageParts, fmt.Sprintf("  📈 Long Total: $%.2f USD", totalLongUSD))
+			messageParts = append(messageParts, fmt.Sprintf("  📈 Long Total: $%s USD", formatPriceCoin(totalLongUSD)))
 		}
-		messageParts = append(messageParts, fmt.Sprintf("  ⚠️ Exposição Total: $%.2f USD", totalExposicaoUSD))
+		messageParts = append(messageParts, fmt.Sprintf("  ⚠️ Exposição Total: $%s USD", formatPriceCoin(totalExposicaoUSD)))
 
 		// Calcular % protegida geral
 		var percentProtegidaGeral float64
 		if totalEquity > 0 {
 			percentProtegidaGeral = (totalProtecaoUSD / totalEquity) * 100
 		}
-		messageParts = append(messageParts, fmt.Sprintf("  📈 %% Protegida: %.2f%%", percentProtegidaGeral))
+		messageParts = append(messageParts, fmt.Sprintf("  📈 %% Protegida: %s%%", formatPriceCoin(percentProtegidaGeral)))
 	
 		// Calcular % longada geral
 		if totalLongUSD > 0 {
@@ -2186,7 +2138,7 @@ func (wsm *WebSocketManager) processExecutionBuffer(accountID int64, wsConn *Web
 			if totalEquity > 0 {
 				percentLongadaGeral = (totalLongUSD / totalEquity) * 100
 			}
-			messageParts = append(messageParts, fmt.Sprintf("  📊 %% Longada: %.2f%%", percentLongadaGeral))
+			messageParts = append(messageParts, fmt.Sprintf("  📊 %% Longada: %s%%", formatPriceCoin(percentLongadaGeral)))
 		}
 	}
 
@@ -2198,6 +2150,330 @@ func (wsm *WebSocketManager) processExecutionBuffer(accountID int64, wsConn *Web
 	if logger != nil {
 		logger.Log("[DEBUG] Notificação de posição enviada após 15 minutos sem execuções")
 	}
+}
+
+func (wsm *WebSocketManager) processSheetsNotification(accountID int64) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "[PANIC] processSheetsNotification para conta %d: %v\n", accountID, r)
+		}
+	}()
+
+	wsm.mu.RLock()
+	conn, exists := wsm.connections[accountID]
+	if !exists || !conn.Running {
+		wsm.mu.RUnlock()
+		return
+	}
+	wsConn := conn
+	wsm.mu.RUnlock()
+
+	if wsConn.Account.WebhookURLGoogleSheets == "" || wsConn.Account.SheetURLGoogleSheets == "" {
+		return
+	}
+
+	sinceWallet := time.Now().Add(-3 * time.Minute)
+	walletRows, err := wsm.db.GetWalletSnapshotsUpdatedSince(accountID, sinceWallet)
+	if err != nil || len(walletRows) == 0 {
+		return
+	}
+
+	lastWallet := mergeWalletSnapshotRows(walletRows)
+	if lastWallet == nil {
+		return
+	}
+
+	positionRows, err := wsm.db.GetPositionSnapshots(accountID)
+	if err != nil {
+		return
+	}
+	positions := make(map[string]*PositionData)
+	for _, row := range positionRows {
+		var pos PositionData
+		if err := json.Unmarshal([]byte(row.Message), &pos); err == nil {
+			positions[row.Symbol] = &pos
+		}
+	}
+
+	calculatePositionValues := func(position *PositionData, totalEquityCoin float64) (longUSD, protecaoUSD, expostoUSD float64) {
+		size, err := strconv.ParseFloat(position.Size, 64)
+		if err != nil {
+			size = 0
+		}
+		if position.Side == "Sell" {
+			protecaoUSD = size
+			longUSD = 0
+		} else {
+			protecaoUSD = 0
+			longUSD = size
+		}
+		expostoUSD = totalEquityCoin - size
+		return
+	}
+
+	logger, _ := getLogger(accountID, wsConn.Account.Name)
+	now := getBrasiliaTime()
+	dateTimeStr := now.Format("02/01/2006 15:04")
+	headers := []string{"data", "moeda", "total_moeda", "total_dolar", "total_protegido", "total_exposto", "total_long"}
+
+	var webhookPayloads []struct {
+		coin    string
+		columns []interface{}
+		headers []string
+	}
+
+	for _, coinBalance := range lastWallet.Coin {
+		coin := coinBalance.Coin
+		var position *PositionData
+		for posSymbol, pos := range positions {
+			posCoin := posSymbol
+			if strings.HasSuffix(posSymbol, "USD") {
+				posCoin = posSymbol[:len(posSymbol)-3]
+			} else if strings.HasSuffix(posSymbol, "USDT") {
+				posCoin = posSymbol[:len(posSymbol)-4]
+			} else if strings.HasSuffix(posSymbol, "USDC") {
+				posCoin = posSymbol[:len(posSymbol)-4]
+			}
+			if posCoin == coin {
+				position = pos
+				break
+			}
+		}
+
+		equity, _ := strconv.ParseFloat(coinBalance.Equity, 64)
+		usdValue, _ := strconv.ParseFloat(coinBalance.UsdValue, 64)
+		var protecaoUSD, expostoUSD, longUSD float64
+		if position != nil {
+			longUSD, protecaoUSD, expostoUSD = calculatePositionValues(position, usdValue)
+		} else {
+			expostoUSD = usdValue
+		}
+
+		columns := []interface{}{
+			dateTimeStr,
+			coinBalance.Coin,
+			equity,
+			usdValue,
+			protecaoUSD,
+			expostoUSD,
+			longUSD,
+		}
+		webhookPayloads = append(webhookPayloads, struct {
+			coin    string
+			columns []interface{}
+			headers []string
+		}{coin: coinBalance.Coin, columns: columns, headers: headers})
+	}
+
+	// Enviar webhooks em goroutine para não bloquear a thread principal
+	webhookURL := wsConn.Account.WebhookURLGoogleSheets
+	sheetURL := wsConn.Account.SheetURLGoogleSheets
+	go func() {
+		for _, p := range webhookPayloads {
+			if err := sendGoogleSheetsWebhook(webhookURL, sheetURL, p.coin, p.columns, p.headers); err != nil {
+				if logger != nil {
+					logger.Log("Erro ao enviar webhook do Google Sheets para %s: %v", p.coin, err)
+				}
+			}
+		}
+	}()
+}
+
+// formatExecTimeToBrasilia converte timestamp em ms (string) para data no formato Brasil "DD/MM/YYYY HH:MM". Se inválido, usa time.Now() em Brasília.
+func formatExecTimeToBrasilia(execTimeMs string) string {
+	ms, err := strconv.ParseInt(execTimeMs, 10, 64)
+	if err != nil {
+		return getBrasiliaTime().Format("02/01/2006 15:04")
+	}
+	t := time.UnixMilli(ms)
+	if loc, err := time.LoadLocation("America/Sao_Paulo"); err == nil {
+		return t.In(loc).Format("02/01/2006 15:04")
+	}
+	brasiliaOffset := -3 * 60 * 60
+	brasiliaTZ := time.FixedZone("BRT", brasiliaOffset)
+	return t.In(brasiliaTZ).Format("02/01/2006 15:04")
+}
+
+// formatQtyCoin formata quantidade/valor em moeda sem notação científica e sem casas decimais fixas (remove zeros à direita).
+func formatQtyCoin(v float64) string {
+	s := fmt.Sprintf("%.15f", v)
+	s = strings.TrimRight(s, "0")
+	s = strings.TrimRight(s, ".")
+	return s
+}
+
+// formatPriceCoin formata preço em moeda sem notação científica e sem casas decimais fixas (remove zeros à direita).
+func formatPriceCoin(v float64) string {
+	s := fmt.Sprintf("%.2f", v)
+	s = strings.TrimRight(s, "0")
+	s = strings.TrimRight(s, ".")
+	return s
+}
+
+// symbolToCoin extrai a moeda do símbolo (ex: BTCUSD -> BTC).
+func symbolToCoin(symbol string) string {
+	if strings.HasSuffix(symbol, "USD") {
+		return symbol[:len(symbol)-3]
+	}
+	if strings.HasSuffix(symbol, "USDT") || strings.HasSuffix(symbol, "USDC") {
+		return symbol[:len(symbol)-4]
+	}
+	return symbol
+}
+
+func (wsm *WebSocketManager) flushExecutionNotificationBuffer(accountID int64) {
+	wsm.mu.RLock()
+	conn, exists := wsm.connections[accountID]
+	if !exists || !conn.Running {
+		wsm.mu.RUnlock()
+		return
+	}
+	wsConn := conn
+	wsm.mu.RUnlock()
+
+	wsm.bufferMu.Lock()
+	buf, exists := wsm.executionNotificationBuffers[accountID]
+	if !exists {
+		wsm.bufferMu.Unlock()
+		return
+	}
+	buf.mu.Lock()
+	executions := make([]ExecutionData, len(buf.executions))
+	copy(executions, buf.executions)
+	buf.executions = buf.executions[:0]
+	if buf.timer != nil {
+		buf.timer.Stop()
+		buf.timer = nil
+	}
+	buf.mu.Unlock()
+	wsm.bufferMu.Unlock()
+
+	if len(executions) == 0 {
+		return
+	}
+
+	logger, _ := getLogger(accountID, wsConn.Account.Name)
+
+	// Discord: uma mensagem com todas as execuções
+	if wsConn.Account.WebhookURLExecutions != "" {
+		var parts []string
+		for _, e := range executions {
+			coin := symbolToCoin(e.Symbol)
+			price, _ := strconv.ParseFloat(e.ExecPrice, 64)
+			qtyUsd, _ := strconv.ParseFloat(e.ExecQty, 64)    // valor em USD
+			qtyCoin, _ := strconv.ParseFloat(e.ExecValue, 64) // valor na moeda (varia muito por moeda)
+			stopText := ""
+			if e.CreateType == "CreateByStopOrder" {
+				stopText = "Stop "
+			}
+			parts = append(parts, fmt.Sprintf("%s - %s %s%s | Preço: %s | %s: %s | USD: %s",
+				formatExecTimeToBrasilia(e.ExecTime), e.Side, stopText, e.OrderType, formatPriceCoin(price), coin, formatQtyCoin(qtyCoin), formatPriceCoin(qtyUsd)))
+		}
+		messageText := strings.Join(parts, "\n")
+		go wsm.sendExecutionNotification(wsConn, messageText)
+	}
+
+	// Google Sheets: agrupar por moeda, uma requisição por moeda
+	if wsConn.Account.WebhookURLGoogleSheets != "" && wsConn.Account.SheetURLGoogleSheetsExecutions != "" {
+		byCoin := make(map[string][]ExecutionData)
+		for _, e := range executions {
+			coin := symbolToCoin(e.Symbol)
+			byCoin[coin] = append(byCoin[coin], e)
+		}
+		webhookURL := wsConn.Account.WebhookURLGoogleSheets
+		sheetURLExec := wsConn.Account.SheetURLGoogleSheetsExecutions
+		for coin, execs := range byCoin {
+			coinCopy := coin
+			execsCopy := make([]ExecutionData, len(execs))
+			copy(execsCopy, execs)
+			go func() {
+				if err := wsm.sendGoogleSheetsExecutionWebhook(webhookURL, sheetURLExec, coinCopy, execsCopy); err != nil && logger != nil {
+					logger.Log("Erro ao enviar webhook de execuções para %s: %v", coinCopy, err)
+				}
+			}()
+		}
+	}
+}
+
+func (wsm *WebSocketManager) sendExecutionNotification(wsConn *WebSocketConnection, messageText string) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "[PANIC] sendExecutionNotification para conta %d: %v\n", wsConn.AccountID, r)
+		}
+	}()
+	if wsConn.Account.WebhookURLExecutions == "" {
+		return
+	}
+	everyoneTag := ""
+	if wsConn.Account.MarkEveryoneExecution {
+		everyoneTag = "@everyone "
+	}
+	now := getBrasiliaTime()
+	timeStamp := fmt.Sprintf("🕘  %s - %s (Horário de Brasília)", now.Format("02/01/2006"), now.Format("15:04"))
+	discordMsg := fmt.Sprintf("%s🔔 Execuções\n%s\n\n%s", everyoneTag, messageText, timeStamp)
+	if err := sendDiscordWebhook(wsConn.Account.WebhookURLExecutions, discordMsg); err != nil {
+		logger, _ := getLogger(wsConn.AccountID, wsConn.Account.Name)
+		if logger != nil {
+			logger.Log("Erro ao enviar webhook de execuções: %v", err)
+		}
+	}
+}
+
+// ExecutionRow representa uma linha no payload de execuções do Google Sheets.
+type ExecutionRow struct {
+	Columns []interface{} `json:"columns"`
+}
+
+func (wsm *WebSocketManager) sendGoogleSheetsExecutionWebhook(webhookURL, sheetURLExecutions, coin string, executions []ExecutionData) error {
+	if webhookURL == "" || sheetURLExecutions == "" {
+		return fmt.Errorf("webhook URL ou sheet URL execuções está vazia")
+	}
+	sheetID, err := extractSheetID(sheetURLExecutions)
+	if err != nil {
+		return fmt.Errorf("erro ao extrair ID da planilha: %w", err)
+	}
+	headers := []string{"data", "moeda", "operação", "tipo", "preço", "total_moeda", "total_dolar"}
+	var rows []ExecutionRow
+	for _, e := range executions {
+
+		stopText := ""
+		if e.CreateType == "CreateByStopOrder" {
+			stopText = "Stop "
+		}
+
+		price, _ := strconv.ParseFloat(e.ExecPrice, 64)
+		qtyUsd, _ := strconv.ParseFloat(e.ExecQty, 64)
+		valCoin, _ := strconv.ParseFloat(e.ExecValue, 64)
+		columns := []interface{}{
+			formatExecTimeToBrasilia(e.ExecTime),
+			coin,
+			e.Side,
+			stopText + e.OrderType,
+			price,
+			valCoin,
+			qtyUsd,
+		}
+		rows = append(rows, ExecutionRow{Columns: columns})
+	}
+	payload := map[string]interface{}{
+		"sheet_id": sheetID,
+		"symbol":   coin + "_exec",
+		"headers":  headers,
+		"rows":     rows,
+	}
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("erro ao serializar payload: %w", err)
+	}
+	resp, err := http.Post(webhookURL, "application/json", bytes.NewReader(jsonData))
+	if err != nil {
+		return fmt.Errorf("erro ao enviar requisição: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("status code: %d", resp.StatusCode)
+	}
+	return nil
 }
 
 func (wsm *WebSocketManager) sendNotification(wsConn *WebSocketConnection, messageText string) {

@@ -57,7 +57,13 @@ function doPost(e) {
     }
 
     // 3. Insere os dados
-    sheet.appendRow(fullData.columns);
+    if (fullData.rows) {
+      fullData.rows.forEach((row) => {
+        sheet.appendRow(row.columns);
+      });
+    } else if (fullData.columns) {
+      sheet.appendRow(fullData.columns);
+    }
     
     response = {
       "status": "success",

@@ -155,6 +155,21 @@ func handleAddAccount(manager *AccountManager, scanner *bufio.Scanner) {
 		return
 	}
 
+	fmt.Print("Webhook Discord para execuções (opcional, deixe em branco para não usar): ")
+	scanner.Scan()
+	webhookURLExecutions := strings.TrimSpace(scanner.Text())
+	if webhookURLExecutions == "cancelar" || webhookURLExecutions == "0" {
+		return
+	}
+
+	fmt.Print("Marcar @everyone em notificações de execuções? (sim/s ou não/n, padrão: não): ")
+	scanner.Scan()
+	markEveryoneExecutionInput := strings.ToLower(strings.TrimSpace(scanner.Text()))
+	markEveryoneExecution := markEveryoneExecutionInput == "sim" || markEveryoneExecutionInput == "s"
+	if markEveryoneExecutionInput == "cancelar" || markEveryoneExecutionInput == "0" {
+		return
+	}
+
 	fmt.Print("Webhook URL Google Planilhas feito com google scripts (opcional, deixe em branco para não usar): ")
 	scanner.Scan()
 	webhookURLGoogleSheets := strings.TrimSpace(scanner.Text())
@@ -197,6 +212,22 @@ func handleAddAccount(manager *AccountManager, scanner *bufio.Scanner) {
 		}
 	}
 
+	var sheetURLGoogleSheetsExecutions string
+	if webhookURLGoogleSheets != "" {
+		fmt.Print("URL da planilha do Google para execuções (opcional, mesma planilha ou outra): ")
+		scanner.Scan()
+		sheetURLGoogleSheetsExecutions = strings.TrimSpace(scanner.Text())
+		if sheetURLGoogleSheetsExecutions == "cancelar" || sheetURLGoogleSheetsExecutions == "0" {
+			return
+		}
+		if sheetURLGoogleSheetsExecutions != "" && !validateGoogleSheetsURL(sheetURLGoogleSheetsExecutions) {
+			fmt.Println("Erro: URL da planilha do Google inválida!")
+			fmt.Println("\nPressione Enter para voltar ao menu principal...")
+			scanner.Scan()
+			return
+		}
+	}
+
 	if nome == "" || apiKey == "" || apiSecret == "" {
 		fmt.Println("Erro: Nome, API Key e API Secret são obrigatórios!")
 		fmt.Println("\nPressione Enter para voltar ao menu principal...")
@@ -205,15 +236,18 @@ func handleAddAccount(manager *AccountManager, scanner *bufio.Scanner) {
 	}
 
 	account := &BybitAccount{
-		Name:                    nome,
-		APIKey:                  apiKey,
-		APISecret:               apiSecret,
-		WebhookURL:              webhookURL,
-		Active:                  true,
-		MarkEveryoneOrder:       markEveryoneOrder,
-		MarkEveryoneWallet:      markEveryoneWallet,
-		WebhookURLGoogleSheets:  webhookURLGoogleSheets,
-		SheetURLGoogleSheets:    sheetURLGoogleSheets,
+		Name:                            nome,
+		APIKey:                          apiKey,
+		APISecret:                       apiSecret,
+		WebhookURL:                      webhookURL,
+		Active:                          true,
+		MarkEveryoneOrder:               markEveryoneOrder,
+		MarkEveryoneWallet:              markEveryoneWallet,
+		WebhookURLGoogleSheets:          webhookURLGoogleSheets,
+		SheetURLGoogleSheets:            sheetURLGoogleSheets,
+		WebhookURLExecutions:            webhookURLExecutions,
+		MarkEveryoneExecution:           markEveryoneExecution,
+		SheetURLGoogleSheetsExecutions:  sheetURLGoogleSheetsExecutions,
 	}
 
 	if err := manager.AddAccount(account); err != nil {
@@ -261,6 +295,17 @@ func handleListAccounts(manager *AccountManager, wsManager *WebSocketManager, sc
 			fmt.Printf("   Monitoramento: %s\n", monitoringStatus)
 			fmt.Printf("   Marcar @everyone em ordens: %s\n", getBooleanText(acc.MarkEveryoneOrder))
 			fmt.Printf("   Marcar @everyone no balance da carteira: %s\n", getBooleanText(acc.MarkEveryoneWallet))
+			if acc.WebhookURLExecutions != "" {
+				fmt.Printf("   Webhook Discord execuções: Configurado\n")
+			} else {
+				fmt.Printf("   Webhook Discord execuções: Não configurado\n")
+			}
+			fmt.Printf("   Marcar @everyone em execuções: %s\n", getBooleanText(acc.MarkEveryoneExecution))
+			if acc.SheetURLGoogleSheetsExecutions != "" {
+				fmt.Printf("   Planilha Google execuções: Configurada\n")
+			} else {
+				fmt.Printf("   Planilha Google execuções: Não configurada\n")
+			}
 		}
 		fmt.Printf("\nTotal: %d conta(s) cadastrada(s)\n", len(accounts))
 	}
@@ -532,11 +577,70 @@ func handleEditAccount(manager *AccountManager, wsManager *WebSocketManager, sca
 		return
 	}
 
+	// Webhook Discord para execuções
+	currentWebhookExecutions := account.WebhookURLExecutions
+	if currentWebhookExecutions == "" {
+		currentWebhookExecutions = "(não configurado)"
+	}
+	fmt.Printf("\nWebhook Discord para execuções atual: %s\n", currentWebhookExecutions)
+	fmt.Print("Novo Webhook Discord para execuções (pressione Enter para manter, ou 'remover' para remover): ")
+	scanner.Scan()
+	newWebhookURLExecutions := strings.TrimSpace(scanner.Text())
+	if newWebhookURLExecutions == "cancelar" || newWebhookURLExecutions == "0" {
+		return
+	}
+	if newWebhookURLExecutions == "" {
+		newWebhookURLExecutions = account.WebhookURLExecutions
+	} else if newWebhookURLExecutions == "remover" {
+		newWebhookURLExecutions = ""
+	}
+
+	// Marcar @everyone em execuções
+	currentMarkEveryoneExecution := "Não"
+	if account.MarkEveryoneExecution {
+		currentMarkEveryoneExecution = "Sim"
+	}
+	fmt.Printf("\nMarcar @everyone em notificações de execuções atual: %s\n", currentMarkEveryoneExecution)
+	fmt.Print("Novo valor (pressione Enter para manter, sim/s ou não/n): ")
+	scanner.Scan()
+	markEveryoneExecutionInput := strings.ToLower(strings.TrimSpace(scanner.Text()))
+	if markEveryoneExecutionInput == "cancelar" || markEveryoneExecutionInput == "0" {
+		return
+	}
+	newMarkEveryoneExecution := account.MarkEveryoneExecution
+	if markEveryoneExecutionInput != "" {
+		newMarkEveryoneExecution = markEveryoneExecutionInput == "sim" || markEveryoneExecutionInput == "s"
+	}
+
+	// URL da planilha Google para execuções
+	currentSheetURLExecutions := account.SheetURLGoogleSheetsExecutions
+	if currentSheetURLExecutions == "" {
+		currentSheetURLExecutions = "(não configurado)"
+	}
+	fmt.Printf("\nURL da planilha Google para execuções atual: %s\n", currentSheetURLExecutions)
+	fmt.Print("Nova URL da planilha para execuções (pressione Enter para manter, ou 'remover'): ")
+	scanner.Scan()
+	newSheetURLGoogleSheetsExecutions := strings.TrimSpace(scanner.Text())
+	if newSheetURLGoogleSheetsExecutions == "cancelar" || newSheetURLGoogleSheetsExecutions == "0" {
+		return
+	}
+	if newSheetURLGoogleSheetsExecutions == "" {
+		newSheetURLGoogleSheetsExecutions = account.SheetURLGoogleSheetsExecutions
+	} else if newSheetURLGoogleSheetsExecutions == "remover" {
+		newSheetURLGoogleSheetsExecutions = ""
+	} else if !validateGoogleSheetsURL(newSheetURLGoogleSheetsExecutions) {
+		fmt.Println("Erro: URL da planilha do Google inválida!")
+		fmt.Println("Formato esperado: https://docs.google.com/spreadsheets/d/.../edit...")
+		fmt.Println("\nPressione Enter para voltar ao menu principal...")
+		scanner.Scan()
+		return
+	}
+
 	// Verificar se a conta está sendo monitorada antes de editar
 	wasMonitored := wsManager.IsConnectionActive(account.ID)
 
 	// Atualizar conta
-	if err := manager.UpdateAccount(account.ID, newName, newWebhook, newMarkEveryoneOrder, newMarkEveryoneWallet, newWebhookURLGoogleSheets, newSheetURLGoogleSheets); err != nil {
+	if err := manager.UpdateAccount(account.ID, newName, newWebhook, newMarkEveryoneOrder, newMarkEveryoneWallet, newWebhookURLGoogleSheets, newSheetURLGoogleSheets, newWebhookURLExecutions, newSheetURLGoogleSheetsExecutions, newMarkEveryoneExecution); err != nil {
 		fmt.Printf("\nErro ao editar conta: %v\n", err)
 		fmt.Println("\nPressione Enter para voltar ao menu principal...")
 		scanner.Scan()
@@ -763,6 +867,17 @@ func handleViewMonitoredAccounts(wsManager *WebSocketManager, scanner *bufio.Sca
 			fmt.Printf("   Status: Monitorando\n")
 			fmt.Printf("   Marcar @everyone em ordens: %s\n", getBooleanText(acc.MarkEveryoneOrder))
 			fmt.Printf("   Marcar @everyone em carteira: %s\n", getBooleanText(acc.MarkEveryoneWallet))
+			if acc.WebhookURLExecutions != "" {
+				fmt.Printf("   Webhook Discord execuções: Configurado\n")
+			} else {
+				fmt.Printf("   Webhook Discord execuções: Não configurado\n")
+			}
+			fmt.Printf("   Marcar @everyone em execuções: %s\n", getBooleanText(acc.MarkEveryoneExecution))
+			if acc.SheetURLGoogleSheetsExecutions != "" {
+				fmt.Printf("   Planilha Google execuções: Configurada\n")
+			} else {
+				fmt.Printf("   Planilha Google execuções: Não configurada\n")
+			}
 		}
 		fmt.Printf("\nTotal: %d conta(s) sendo monitorada(s)\n", len(monitoredAccounts))
 	}
