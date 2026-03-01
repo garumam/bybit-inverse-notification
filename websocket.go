@@ -32,13 +32,10 @@ type delayNotificationItem struct {
 type WebSocketManager struct {
 	accountManager               *AccountManager
 	db                           *Database
-	connections                  map[int64]*WebSocketConnection
-	mu                           sync.RWMutex
-	orderBuffers                 map[int64]*OrderBuffer
-	cancelBuffers                map[int64]*CancelBuffer
-	executionBuffers             map[int64]*ExecutionBuffer
-	executionNotificationBuffers  map[int64]*ExecutionNotificationBuffer
-	delayBuffers                  map[int64]*DelayNotificationBuffer
+	connections      map[int64]*WebSocketConnection
+	mu               sync.RWMutex
+	walletNotificationBuffers map[int64]*WalletNotification
+	delayBuffers     map[int64]*DelayNotificationBuffer
 	bufferMu                     sync.RWMutex
 }
 
@@ -53,28 +50,7 @@ type DelayNotificationBuffer struct {
 	mu          sync.Mutex
 }
 
-type ExecutionNotificationBuffer struct {
-	executions []ExecutionData
-	timer      *time.Timer
-	mu         sync.Mutex
-	accountID  int64
-}
-
-type OrderBuffer struct {
-	orders    []OrderData
-	timer     *time.Timer
-	mu        sync.Mutex
-	accountID int64
-}
-
-type CancelBuffer struct {
-	orders    []OrderData
-	timer     *time.Timer
-	mu        sync.Mutex
-	accountID int64
-}
-
-type ExecutionBuffer struct {
+type WalletNotification struct {
 	discordTimer *time.Timer // 15 min: notificação Discord (wallet)
 	sheetsTimer  *time.Timer // 2 min: notificação Google Sheets
 	mu           sync.Mutex
@@ -191,14 +167,11 @@ type OrderData struct {
 
 func NewWebSocketManager(db *Database, accountManager *AccountManager) *WebSocketManager {
 	return &WebSocketManager{
-		accountManager:               accountManager,
-		db:                           db,
-		connections:                  make(map[int64]*WebSocketConnection),
-		orderBuffers:                 make(map[int64]*OrderBuffer),
-		cancelBuffers:                make(map[int64]*CancelBuffer),
-		executionBuffers:             make(map[int64]*ExecutionBuffer),
-		executionNotificationBuffers:  make(map[int64]*ExecutionNotificationBuffer),
-		delayBuffers:                 make(map[int64]*DelayNotificationBuffer),
+		accountManager:   accountManager,
+		db:               db,
+		connections:      make(map[int64]*WebSocketConnection),
+		walletNotificationBuffers: make(map[int64]*WalletNotification),
+		delayBuffers:     make(map[int64]*DelayNotificationBuffer),
 	}
 }
 
@@ -320,36 +293,16 @@ func (wsm *WebSocketManager) StopConnection(accountID int64) {
 
 	// Limpar buffers
 	wsm.bufferMu.Lock()
-	if orderBuffer, exists := wsm.orderBuffers[accountID]; exists {
-		if orderBuffer.timer != nil {
-			orderBuffer.timer.Stop()
+	if walletNotificationBuffer, exists := wsm.walletNotificationBuffers[accountID]; exists {
+		walletNotificationBuffer.mu.Lock()
+		if walletNotificationBuffer.discordTimer != nil {
+			walletNotificationBuffer.discordTimer.Stop()
 		}
-		delete(wsm.orderBuffers, accountID)
-	}
-	if cancelBuffer, exists := wsm.cancelBuffers[accountID]; exists {
-		if cancelBuffer.timer != nil {
-			cancelBuffer.timer.Stop()
+		if walletNotificationBuffer.sheetsTimer != nil {
+			walletNotificationBuffer.sheetsTimer.Stop()
 		}
-		delete(wsm.cancelBuffers, accountID)
-	}
-	if executionBuffer, exists := wsm.executionBuffers[accountID]; exists {
-		executionBuffer.mu.Lock()
-		if executionBuffer.discordTimer != nil {
-			executionBuffer.discordTimer.Stop()
-		}
-		if executionBuffer.sheetsTimer != nil {
-			executionBuffer.sheetsTimer.Stop()
-		}
-		executionBuffer.mu.Unlock()
-		delete(wsm.executionBuffers, accountID)
-	}
-	if execNotifBuffer, exists := wsm.executionNotificationBuffers[accountID]; exists {
-		execNotifBuffer.mu.Lock()
-		if execNotifBuffer.timer != nil {
-			execNotifBuffer.timer.Stop()
-		}
-		execNotifBuffer.mu.Unlock()
-		delete(wsm.executionNotificationBuffers, accountID)
+		walletNotificationBuffer.mu.Unlock()
+		delete(wsm.walletNotificationBuffers, accountID)
 	}
 	if delayBuf, exists := wsm.delayBuffers[accountID]; exists {
 		delayBuf.mu.Lock()
@@ -770,185 +723,27 @@ func (wsm *WebSocketManager) handleOrderMessage(wsConn *WebSocketConnection, ord
 			continue
 		}
 
-		// Quando delay está ativo, enviar ordens e stops para o buffer unificado
-		if wsConn.Account.NotificationDelaySeconds > 0 {
-			if orderData.OrderStatus == "Untriggered" {
-				wsm.addStopToDelayBuffer(wsConn.AccountID, orderData, wsConn)
-				continue
-			}
-			if orderData.OrderStatus == "Deactivated" {
-				wsm.addStopToDelayBuffer(wsConn.AccountID, orderData, wsConn)
-				continue
-			}
-			if orderData.CreateType == "CreateByStopOrder" {
-				if logger != nil {
-					logger.Log("[DEBUG] Ordem ignorada - CreateByStopOrder (status: %s)", orderData.OrderStatus)
-				}
-				continue
-			}
-			// Todas as ordens (New, Filled, Cancelled, etc.) vão para o buffer de delay
-			wsm.addOrderToDelayBuffer(wsConn.AccountID, orderData, wsConn)
-			continue
-		}
-
-		// Processar stops Untriggered primeiro (sem delay)
 		if orderData.OrderStatus == "Untriggered" {
-			wsm.processStopOrder(wsConn, orderData)
+			wsm.addStopToDelayBuffer(wsConn.AccountID, orderData, wsConn)
 			continue
 		}
-
-		// Processar cancelamentos de stops não triggerados (Deactivated)
-		// Permitir processar mesmo se for CreateByStopOrder
 		if orderData.OrderStatus == "Deactivated" {
-			wsm.processStopCancellation(wsConn, orderData)
+			wsm.addStopToDelayBuffer(wsConn.AccountID, orderData, wsConn)
 			continue
 		}
-
-		// Ignorar ordens criadas por stop order (exceto stops Untriggered e Deactivated já processados acima)
 		if orderData.CreateType == "CreateByStopOrder" {
 			if logger != nil {
 				logger.Log("[DEBUG] Ordem ignorada - CreateByStopOrder (status: %s)", orderData.OrderStatus)
 			}
 			continue
 		}
+		// Todas as ordens (New, Filled, Cancelled, etc.) vão para o buffer de delay
+		wsm.addOrderToDelayBuffer(wsConn.AccountID, orderData, wsConn)
 
-		// Processar abertura de ordem ou cancelamento
-		// Verificar se é Limit executada rapidamente (até 3 segundos entre criação e atualização)
-		// Verificar se a ordem Limit foi movida para outro preço
-		isLimitExecutedQuickly := false
-		isLimitMoved := false
-		if orderData.OrderType == "Limit" && (orderData.OrderStatus == "Filled" || orderData.OrderStatus == "PartiallyFilled") {
-			createdTime, err1 := strconv.ParseInt(orderData.CreatedTime, 10, 64)
-			updatedTime, err2 := strconv.ParseInt(orderData.UpdatedTime, 10, 64)
-			if err1 == nil && err2 == nil {
-				timeDiff := updatedTime - createdTime
-				if timeDiff >= 0 && timeDiff <= 3000 { // Diferença de até 3 segundos (3000ms)
-					isLimitExecutedQuickly = true
-				}
-			}
-
-			// Verificar se ordem existe no banco
-			existingOrderJSON, err := wsm.accountManager.GetOrder(orderData.OrderID)
-			if err == nil && existingOrderJSON != "" {
-				// Ordem existe, verificar se o preço mudou
-				var existingOrder OrderData
-				if err := json.Unmarshal([]byte(existingOrderJSON), &existingOrder); err == nil {
-					// Usar getDisplayPrice para obter os preços corretos
-					oldPriceStr := getDisplayPrice(existingOrder)
-					newPriceStr := getDisplayPrice(orderData)
-					
-					// Comparar preços usando os valores corretos
-					if oldPriceStr != newPriceStr {
-						isLimitMoved = true
-					}
-				}
-
-				if !isLimitMoved {
-					// Remover do banco se existir
-					if err := wsm.accountManager.DeleteOrder(orderData.OrderID); err != nil {
-						if logger != nil {
-							logger.Log("[DEBUG] Erro ao remover ordem preenchida %s do banco: %v", orderData.OrderID, err)
-						}
-					}
-				}
-			}
-		}
-
-		if orderData.OrderStatus == "New" || (orderData.OrderType == "Market" && (orderData.OrderStatus == "Filled" || orderData.OrderStatus == "PartiallyFilled")) || isLimitExecutedQuickly || isLimitMoved {
-			wsm.addOrderToBuffer(wsConn.AccountID, orderData, wsConn)
-		} else if orderData.OrderStatus == "Cancelled" || (orderData.CancelType != "" && orderData.StopOrderType != "Stop" && orderData.OrderStatus != "Filled" && orderData.OrderStatus != "PartiallyFilled") {
-			// Excluir stops do processamento de cancelamento normal
-			wsm.addCancelToBuffer(wsConn.AccountID, orderData, wsConn)
-		}
 	}
 }
 
-func (wsm *WebSocketManager) addOrderToBuffer(accountID int64, order OrderData, wsConn *WebSocketConnection) {
-	wsm.bufferMu.Lock()
-	buffer, exists := wsm.orderBuffers[accountID]
-	if !exists {
-		buffer = &OrderBuffer{
-			orders:    []OrderData{},
-			accountID: accountID,
-		}
-		wsm.orderBuffers[accountID] = buffer
-	}
-	wsm.bufferMu.Unlock()
-
-	buffer.mu.Lock()
-	defer buffer.mu.Unlock()
-
-	// Adicionar ordem ao buffer
-	buffer.orders = append(buffer.orders, order)
-
-	logger, _ := getLogger(accountID, wsConn.Account.Name)
-
-	// Se é a primeira ordem, iniciar timer de 2 segundos
-	if len(buffer.orders) == 1 {
-		buffer.timer = time.AfterFunc(2*time.Second, func() {
-			defer func() {
-				if r := recover(); r != nil {
-					fmt.Fprintf(os.Stderr, "[PANIC] processOrderBuffer (timer) para conta %d: %v\n", accountID, r)
-				}
-			}()
-			wsm.processOrderBuffer(accountID, wsConn)
-		})
-		if logger != nil {
-			logger.Log("[DEBUG] Primeira ordem recebida, iniciando timer de 2s para agrupamento")
-		}
-	} else {
-		// Se já existe timer, resetar para mais 2 segundos
-		if buffer.timer != nil {
-			if !buffer.timer.Stop() {
-				// Timer já foi executado, não fazer nada
-			}
-		}
-		buffer.timer = time.AfterFunc(2*time.Second, func() {
-			wsm.processOrderBuffer(accountID, wsConn)
-		})
-		if logger != nil {
-			logger.Log("[DEBUG] Ordem adicional recebida, resetando timer de 2s (total: %d ordens)", len(buffer.orders))
-		}
-	}
-}
-
-func (wsm *WebSocketManager) addCancelToBuffer(accountID int64, order OrderData, wsConn *WebSocketConnection) {
-	wsm.bufferMu.Lock()
-	buffer, exists := wsm.cancelBuffers[accountID]
-	if !exists {
-		buffer = &CancelBuffer{
-			orders:    []OrderData{},
-			accountID: accountID,
-		}
-		wsm.cancelBuffers[accountID] = buffer
-	}
-	wsm.bufferMu.Unlock()
-
-	buffer.mu.Lock()
-	defer buffer.mu.Unlock()
-
-	// Adicionar cancelamento ao buffer
-	buffer.orders = append(buffer.orders, order)
-
-	// Resetar timer de 2 segundos a cada nova ordem cancelada
-	if buffer.timer != nil {
-		buffer.timer.Stop()
-	}
-	buffer.timer = time.AfterFunc(2*time.Second, func() {
-		defer func() {
-			if r := recover(); r != nil {
-				fmt.Fprintf(os.Stderr, "[PANIC] processCancelBuffer (timer) para conta %d: %v\n", accountID, r)
-			}
-		}()
-		wsm.processCancelBuffer(accountID, wsConn)
-	})
-	logger, _ := getLogger(accountID, wsConn.Account.Name)
-	if logger != nil {
-		logger.Log("[DEBUG] Cancelamento recebido, resetando timer de 2s (total: %d cancelamentos)", len(buffer.orders))
-	}
-}
-
-// formatOrderGroupMessage formata uma mensagem para um grupo de ordens (uma ou várias). Usado por processOrderBuffer e processDelayBuffer.
+// formatOrderGroupMessage formata uma mensagem para um grupo de ordens (uma ou várias). Usado por processDelayBuffer.
 func formatOrderGroupMessage(groupOrders []OrderData) string {
 	if len(groupOrders) == 0 {
 		return ""
@@ -1002,7 +797,7 @@ func formatOrderGroupMessage(groupOrders []OrderData) string {
 		formatPriceCoin(minPrice), formatPriceCoin(maxPrice), formatPriceCoin(totalQty))
 }
 
-// formatOrderMovedMessage formata mensagem de ordem movida (preço alterado). Usado por processOrderBuffer e processDelayBuffer.
+// formatOrderMovedMessage formata mensagem de ordem movida (preço alterado). Usado por processDelayBuffer.
 func formatOrderMovedMessage(order OrderData, oldPrice, newPrice float64) string {
 	reducePrefix := ""
 	if order.ReduceOnly {
@@ -1070,7 +865,7 @@ func formatStopOrderMessage(order OrderData) string {
 		stopIcon, reducePrefix, order.Side, order.OrderType, order.Symbol, formatPriceCoin(triggerPrice), mensagemQty)
 }
 
-// formatStopMovedMessage formata mensagem de stop movido (trigger price alterado). Usado por processStopOrder e processDelayBuffer.
+// formatStopMovedMessage formata mensagem de stop movido (trigger price alterado). Usado por processDelayBuffer.
 func formatStopMovedMessage(order OrderData, oldPrice, newPrice float64) string {
 	reducePrefix := ""
 	if order.ReduceOnly {
@@ -1160,7 +955,7 @@ func (wsm *WebSocketManager) getOrCreateDelayBuffer(accountID int64, delaySec in
 func (wsm *WebSocketManager) addOrderToDelayBuffer(accountID int64, order OrderData, wsConn *WebSocketConnection) {
 	delaySec := wsConn.Account.NotificationDelaySeconds
 	if delaySec <= 0 {
-		return
+		delaySec = 2
 	}
 	wsm.bufferMu.Lock()
 	buf := wsm.getOrCreateDelayBuffer(accountID, delaySec)
@@ -1193,7 +988,7 @@ func (wsm *WebSocketManager) addOrderToDelayBuffer(accountID int64, order OrderD
 func (wsm *WebSocketManager) addStopToDelayBuffer(accountID int64, order OrderData, wsConn *WebSocketConnection) {
 	delaySec := wsConn.Account.NotificationDelaySeconds
 	if delaySec <= 0 {
-		return
+		delaySec = 2
 	}
 	wsm.bufferMu.Lock()
 	buf := wsm.getOrCreateDelayBuffer(accountID, delaySec)
@@ -1226,7 +1021,7 @@ func (wsm *WebSocketManager) addStopToDelayBuffer(accountID int64, order OrderDa
 func (wsm *WebSocketManager) addExecutionToDelayBuffer(accountID int64, exec ExecutionData, wsConn *WebSocketConnection) {
 	delaySec := wsConn.Account.NotificationDelaySeconds
 	if delaySec <= 0 {
-		return
+		delaySec = 2
 	}
 	wsm.bufferMu.Lock()
 	buf := wsm.getOrCreateDelayBuffer(accountID, delaySec)
@@ -1635,404 +1430,6 @@ func (wsm *WebSocketManager) processDelayBuffer(accountID int64, wsConn *WebSock
 	}
 }
 
-func (wsm *WebSocketManager) processOrderBuffer(accountID int64, wsConn *WebSocketConnection) {
-	// Capturar panics
-	defer func() {
-		if r := recover(); r != nil {
-			fmt.Fprintf(os.Stderr, "[PANIC] processOrderBuffer para conta %d: %v\n", accountID, r)
-			func() {
-				defer func() {
-					if r2 := recover(); r2 != nil {
-						fmt.Fprintf(os.Stderr, "ERRO ao tentar logar panic: %v\n", r2)
-					}
-				}()
-				logger, _ := getLogger(accountID, wsConn.Account.Name)
-				if logger != nil {
-					logger.Log("PANIC em processOrderBuffer: %v", r)
-				}
-			}()
-		}
-	}()
-
-	// Verificar se a conexão ainda está ativa
-	wsm.mu.RLock()
-	conn, exists := wsm.connections[accountID]
-	if !exists || !conn.Running {
-		wsm.mu.RUnlock()
-		return
-	}
-	// Usar a conexão atual do mapa (pode ter mudado)
-	activeConn := conn
-	wsm.mu.RUnlock()
-
-	wsm.bufferMu.Lock()
-	buffer, exists := wsm.orderBuffers[accountID]
-	if !exists {
-		wsm.bufferMu.Unlock()
-		return
-	}
-
-	buffer.mu.Lock()
-	if len(buffer.orders) == 0 {
-		buffer.mu.Unlock()
-		wsm.bufferMu.Unlock()
-		return
-	}
-
-	// Copiar ordens e limpar buffer
-	orders := make([]OrderData, len(buffer.orders))
-	copy(orders, buffer.orders)
-	buffer.orders = []OrderData{} // Limpar buffer
-	buffer.mu.Unlock()
-
-	delete(wsm.orderBuffers, accountID)
-	wsm.bufferMu.Unlock()
-
-	if len(orders) == 0 {
-		return
-	}
-
-	// Filtrar ordens duplicadas: manter apenas a mais recente por orderId
-	orderMap := make(map[string]OrderData)
-	for _, order := range orders {
-		existingOrder, exists := orderMap[order.OrderID]
-		if !exists {
-			// Primeira ocorrência deste orderId
-			orderMap[order.OrderID] = order
-		} else {
-			// Comparar updatedTime para manter a mais recente
-			existingUpdatedTime, err1 := strconv.ParseInt(existingOrder.UpdatedTime, 10, 64)
-			currentUpdatedTime, err2 := strconv.ParseInt(order.UpdatedTime, 10, 64)
-			
-			// Se houver erro ao parsear, manter a existente
-			if err1 != nil || err2 != nil {
-				continue
-			}
-			
-			// Se a ordem atual é mais recente, substituir
-			if currentUpdatedTime > existingUpdatedTime {
-				orderMap[order.OrderID] = order
-			}
-		}
-	}
-
-	// Converter o mapa de volta para slice
-	orders = make([]OrderData, 0, len(orderMap))
-	for _, order := range orderMap {
-		orders = append(orders, order)
-	}
-
-	if len(orders) == 0 {
-		return
-	}
-
-	// Usar a conexão ativa
-	wsConn = activeConn
-
-	// Mapa para rastrear ordens que foram notificadas como movidas
-	movedOrders := make(map[string]bool)
-
-	// Verificar ordens no banco e detectar mudanças de preço
-	for _, order := range orders {
-		// Serializar ordem para JSON
-		orderJSON, err := json.Marshal(order)
-		if err != nil {
-			logger, _ := getLogger(accountID, wsConn.Account.Name)
-			if logger != nil {
-				logger.Log("[DEBUG] Erro ao serializar ordem %s: %v", order.OrderID, err)
-			}
-			continue
-		}
-
-		// Verificar se ordem já existe no banco
-		existingOrderJSON, err := wsm.accountManager.GetOrder(order.OrderID)
-		if err == nil && existingOrderJSON != "" {
-			// Ordem existe, verificar se o preço mudou
-			var existingOrder OrderData
-			if err := json.Unmarshal([]byte(existingOrderJSON), &existingOrder); err == nil {
-				// Usar getDisplayPrice para obter os preços corretos
-				oldPriceStr := getDisplayPrice(existingOrder)
-				newPriceStr := getDisplayPrice(order)
-				
-				// Comparar preços usando os valores corretos
-				if oldPriceStr != newPriceStr {
-					oldPrice, errOld := strconv.ParseFloat(oldPriceStr, 64)
-					newPrice, errNew := strconv.ParseFloat(newPriceStr, 64)
-					// Só notificar "ordem movida" se ambos os preços forem diferentes de 0
-					if errOld == nil && errNew == nil && oldPrice != 0 && newPrice != 0 {
-						messageText := formatOrderMovedMessage(order, oldPrice, newPrice)
-						wsm.sendNotificationWithType(wsConn, messageText, true, false)
-						movedOrders[order.OrderID] = true
-						logger, _ := getLogger(accountID, wsConn.Account.Name)
-						if logger != nil {
-							logger.Log("[DEBUG] Ordem %s movida de %.2f para %.2f", order.OrderID, oldPrice, newPrice)
-						}
-					}
-				}
-			}
-		}
-
-		orderNewPriceStr := getDisplayPrice(order)
-		orderNewPrice, errNewOrder := strconv.ParseFloat(orderNewPriceStr, 64)
-
-		if order.OrderType != "Market" && order.OrderStatus != "Filled" && order.OrderStatus != "PartiallyFilled" && errNewOrder == nil && orderNewPrice != 0 {
-			// Salvar/atualizar ordem no banco
-			if err := wsm.accountManager.SaveOrder(order.OrderID, accountID, string(orderJSON)); err != nil {
-				logger, _ := getLogger(accountID, wsConn.Account.Name)
-				if logger != nil {
-					logger.Log("[DEBUG] Erro ao salvar ordem %s no banco: %v", order.OrderID, err)
-				}
-			}
-		} else {
-			// Remover do banco se existir
-			if err := wsm.accountManager.DeleteOrder(order.OrderID); err != nil {
-				logger, _ := getLogger(accountID, wsConn.Account.Name)
-				if logger != nil {
-					logger.Log("[DEBUG] Erro ao remover ordem preenchida %s do banco: %v", order.OrderID, err)
-				}
-			}
-		}
-	}
-
-	// Filtrar ordens que foram notificadas como movidas
-	finalOrders := make([]OrderData, 0)
-	for _, order := range orders {
-		if !movedOrders[order.OrderID] {
-			finalOrders = append(finalOrders, order)
-		}
-	}
-	orders = finalOrders
-
-	if len(orders) == 0 {
-		return
-	}
-
-	// Agrupar ordens por tipo (Side + OrderType + ReduceOnly)
-	groups := make(map[string][]OrderData)
-	for _, order := range orders {
-		reducePrefix := ""
-		if order.ReduceOnly {
-			reducePrefix = "Reduce"
-		}
-		key := fmt.Sprintf("%s_%s_%s_%s", order.Symbol, reducePrefix, order.Side, order.OrderType)
-		groups[key] = append(groups[key], order)
-	}
-
-	// Processar cada grupo
-	for key, groupOrders := range groups {
-		if len(groupOrders) == 0 {
-			continue
-		}
-		messageText := formatOrderGroupMessage(groupOrders)
-		if messageText == "" {
-			continue
-		}
-		wsm.sendNotificationWithType(wsConn, messageText, true, false)
-		logger, _ := getLogger(accountID, wsConn.Account.Name)
-		if logger != nil {
-			logger.Log("[DEBUG] Processado grupo %s: %d ordens", key, len(groupOrders))
-		}
-	}
-}
-
-func (wsm *WebSocketManager) processCancelBuffer(accountID int64, wsConn *WebSocketConnection) {
-	// Capturar panics
-	defer func() {
-		if r := recover(); r != nil {
-			fmt.Fprintf(os.Stderr, "[PANIC] processCancelBuffer para conta %d: %v\n", accountID, r)
-			func() {
-				defer func() {
-					if r2 := recover(); r2 != nil {
-						fmt.Fprintf(os.Stderr, "ERRO ao tentar logar panic: %v\n", r2)
-					}
-				}()
-				logger, _ := getLogger(accountID, wsConn.Account.Name)
-				if logger != nil {
-					logger.Log("PANIC em processCancelBuffer: %v", r)
-				}
-			}()
-		}
-	}()
-
-	// Verificar se a conexão ainda está ativa
-	wsm.mu.RLock()
-	conn, exists := wsm.connections[accountID]
-	if !exists || !conn.Running {
-		wsm.mu.RUnlock()
-		return
-	}
-	// Usar a conexão atual do mapa (pode ter mudado)
-	activeConn := conn
-	wsm.mu.RUnlock()
-
-	wsm.bufferMu.Lock()
-	buffer, exists := wsm.cancelBuffers[accountID]
-	if !exists {
-		wsm.bufferMu.Unlock()
-		return
-	}
-
-	buffer.mu.Lock()
-	if len(buffer.orders) == 0 {
-		buffer.mu.Unlock()
-		wsm.bufferMu.Unlock()
-		return
-	}
-
-	// Copiar ordens e limpar buffer
-	orders := make([]OrderData, len(buffer.orders))
-	copy(orders, buffer.orders)
-	buffer.orders = []OrderData{} // Limpar buffer
-	buffer.mu.Unlock()
-
-	delete(wsm.cancelBuffers, accountID)
-	wsm.bufferMu.Unlock()
-
-	if len(orders) == 0 {
-		return
-	}
-
-	// Usar a conexão ativa
-	wsConn = activeConn
-
-	// Remover todas as ordens do banco (sempre)
-	for _, order := range orders {
-		if err := wsm.accountManager.DeleteOrder(order.OrderID); err != nil {
-			logger, _ := getLogger(accountID, wsConn.Account.Name)
-			if logger != nil {
-				logger.Log("[DEBUG] Erro ao remover ordem %s do banco: %v", order.OrderID, err)
-			}
-		}
-	}
-
-	// Notificar apenas ordens com preço válido (> 0), para evitar "Market @ 0"
-	var ordersToNotify []OrderData
-	for _, order := range orders {
-		if hasValidDisplayPrice(order) {
-			ordersToNotify = append(ordersToNotify, order)
-		}
-	}
-	if len(ordersToNotify) == 0 {
-		return
-	}
-
-	messageText := formatCancelMessage(ordersToNotify)
-	if messageText == "" {
-		return
-	}
-	wsm.sendNotificationWithType(wsConn, messageText, true, false)
-	logger, _ := getLogger(accountID, wsConn.Account.Name)
-	if logger != nil {
-		logger.Log("[DEBUG] Processado %d cancelamentos agrupados", len(orders))
-	}
-}
-
-func (wsm *WebSocketManager) processStopOrder(wsConn *WebSocketConnection, order OrderData) {
-	// Processar stop order imediatamente (sem delay)
-	reducePrefix := ""
-	if order.ReduceOnly {
-		reducePrefix = "Reduce "
-	}
-
-	// Converter triggerPrice e qty para float para formatação
-	triggerPrice, err := strconv.ParseFloat(order.TriggerPrice, 64)
-	if err != nil {
-		triggerPrice = 0
-	}
-
-	// Verificar se stop já existe no banco e detectar mudança de preço
-	existingOrderJSON, err := wsm.accountManager.GetOrder(order.OrderID)
-	orderMoved := false
-	if err == nil && existingOrderJSON != "" {
-		var existingOrder OrderData
-		if err := json.Unmarshal([]byte(existingOrderJSON), &existingOrder); err == nil {
-			if existingOrder.TriggerPrice != order.TriggerPrice && triggerPrice != 0 {
-				oldPrice, _ := strconv.ParseFloat(existingOrder.TriggerPrice, 64)
-				newPrice, _ := strconv.ParseFloat(order.TriggerPrice, 64)
-				messageText := formatStopMovedMessage(order, oldPrice, newPrice)
-				wsm.sendNotificationWithType(wsConn, messageText, true, false)
-				orderMoved = true
-				logger, _ := getLogger(wsConn.AccountID, wsConn.Account.Name)
-				if logger != nil {
-					logger.Log("[DEBUG] Stop %s movido de %.2f para %.2f", order.OrderID, oldPrice, newPrice)
-				}
-			}
-		}
-	}
-
-	// Salvar/atualizar stop no banco
-	orderJSON, err := json.Marshal(order)
-	if err == nil {
-		// Se a ordem está Filled ou PartiallyFilled, remover do banco e não processar
-		if order.OrderStatus != "Filled" && order.OrderStatus != "PartiallyFilled" && triggerPrice != 0 {
-			if err := wsm.accountManager.SaveOrder(order.OrderID, wsConn.AccountID, string(orderJSON)); err != nil {
-				logger, _ := getLogger(wsConn.AccountID, wsConn.Account.Name)
-				if logger != nil {
-					logger.Log("[DEBUG] Erro ao salvar stop %s no banco: %v", order.OrderID, err)
-				}
-			}
-		} else {
-			if err := wsm.accountManager.DeleteOrder(order.OrderID); err != nil {
-				logger, _ := getLogger(wsConn.AccountID, wsConn.Account.Name)
-				if logger != nil {
-					logger.Log("[DEBUG] Erro ao remover stop preenchido %s do banco: %v", order.OrderID, err)
-				}
-			}
-		}
-	}
-
-	// Se a ordem foi notificada como movida, não enviar notificação normal
-	if orderMoved {
-		return
-	}
-
-	// Cancelar notificação se triggerPrice for 0
-	if triggerPrice == 0 {
-		return
-	}
-
-	messageText := formatStopOrderMessage(order)
-	wsm.sendNotificationWithType(wsConn, messageText, true, false)
-	logger, _ := getLogger(wsConn.AccountID, wsConn.Account.Name)
-	if logger != nil {
-		logger.Log("[DEBUG] Stop order processado - %s %s%s @ %.2f", order.Symbol, reducePrefix, order.Side, triggerPrice)
-	}
-}
-
-func (wsm *WebSocketManager) processStopCancellation(wsConn *WebSocketConnection, order OrderData) {
-	// Remover stop do banco se existir
-	if err := wsm.accountManager.DeleteOrder(order.OrderID); err != nil {
-		logger, _ := getLogger(wsConn.AccountID, wsConn.Account.Name)
-		if logger != nil {
-			logger.Log("[DEBUG] Erro ao remover stop %s do banco: %v", order.OrderID, err)
-		}
-	}
-
-	// Processar cancelamento de stop não triggerado imediatamente (sem delay)
-	reducePrefix := ""
-	if order.ReduceOnly {
-		reducePrefix = "Reduce "
-	}
-
-	// Converter triggerPrice e qty para float para formatação
-	triggerPrice, err := strconv.ParseFloat(order.TriggerPrice, 64)
-	if err != nil {
-		triggerPrice = 0
-	}
-
-	// Se triggerPrice for 0, cancelar notificação
-	if triggerPrice == 0 {
-		return
-	}
-
-	messageText := formatStopCancellationMessage(order)
-	wsm.sendNotificationWithType(wsConn, messageText, true, false)
-	logger, _ := getLogger(wsConn.AccountID, wsConn.Account.Name)
-	if logger != nil {
-		logger.Log("[DEBUG] Stop cancelado processado - %s %s%s @ %.2f", order.Symbol, reducePrefix, order.Side, triggerPrice)
-	}
-}
-
 func (wsm *WebSocketManager) handleExecutionMessage(wsConn *WebSocketConnection, execMsg BybitExecutionMessage) {
 	// Capturar panics
 	defer func() {
@@ -2083,13 +1480,10 @@ func (wsm *WebSocketManager) handleExecutionMessage(wsConn *WebSocketConnection,
 		}
 
 		// Adicionar ao buffer de execution (inicia/reseta timer de 15 minutos)
-		wsm.addExecutionToBuffer(wsConn.AccountID, wsConn)
-		// Com delay ativo: buffer unificado; senão: buffer de notificação 5s
-		if wsConn.Account.NotificationDelaySeconds > 0 {
-			wsm.addExecutionToDelayBuffer(wsConn.AccountID, execData, wsConn)
-		} else {
-			wsm.addExecutionToNotificationBuffer(wsConn.AccountID, execData, wsConn)
-		}
+		wsm.addWalletNotificationToBuffer(wsConn.AccountID, wsConn)
+
+		wsm.addExecutionToDelayBuffer(wsConn.AccountID, execData, wsConn)
+
 	}
 }
 
@@ -2188,12 +1582,12 @@ func (wsm *WebSocketManager) handleWalletMessage(wsConn *WebSocketConnection, wa
 	}
 }
 
-func (wsm *WebSocketManager) addExecutionToBuffer(accountID int64, wsConn *WebSocketConnection) {
+func (wsm *WebSocketManager) addWalletNotificationToBuffer(accountID int64, wsConn *WebSocketConnection) {
 	wsm.bufferMu.Lock()
-	buffer, exists := wsm.executionBuffers[accountID]
+	buffer, exists := wsm.walletNotificationBuffers[accountID]
 	if !exists {
-		buffer = &ExecutionBuffer{accountID: accountID}
-		wsm.executionBuffers[accountID] = buffer
+		buffer = &WalletNotification{accountID: accountID}
+		wsm.walletNotificationBuffers[accountID] = buffer
 	}
 	wsm.bufferMu.Unlock()
 
@@ -2206,10 +1600,10 @@ func (wsm *WebSocketManager) addExecutionToBuffer(accountID int64, wsConn *WebSo
 	buffer.discordTimer = time.AfterFunc(15*time.Minute, func() {
 		defer func() {
 			if r := recover(); r != nil {
-				fmt.Fprintf(os.Stderr, "[PANIC] processExecutionBuffer (timer) para conta %d: %v\n", accountID, r)
+				fmt.Fprintf(os.Stderr, "[PANIC] processWalletNotification (timer) para conta %d: %v\n", accountID, r)
 			}
 		}()
-		wsm.processExecutionBuffer(accountID, wsConn)
+		wsm.processWalletNotification(accountID, wsConn)
 	})
 	logger, _ := getLogger(accountID, wsConn.Account.Name)
 	if logger != nil {
@@ -2219,10 +1613,10 @@ func (wsm *WebSocketManager) addExecutionToBuffer(accountID int64, wsConn *WebSo
 
 func (wsm *WebSocketManager) resetSheetsTimer(accountID int64, wsConn *WebSocketConnection) {
 	wsm.bufferMu.Lock()
-	buffer, exists := wsm.executionBuffers[accountID]
+	buffer, exists := wsm.walletNotificationBuffers[accountID]
 	if !exists {
-		buffer = &ExecutionBuffer{accountID: accountID}
-		wsm.executionBuffers[accountID] = buffer
+		buffer = &WalletNotification{accountID: accountID}
+		wsm.walletNotificationBuffers[accountID] = buffer
 	}
 	wsm.bufferMu.Unlock()
 
@@ -2239,32 +1633,6 @@ func (wsm *WebSocketManager) resetSheetsTimer(accountID int64, wsConn *WebSocket
 			}
 		}()
 		wsm.processSheetsNotification(accountID)
-	})
-}
-
-func (wsm *WebSocketManager) addExecutionToNotificationBuffer(accountID int64, exec ExecutionData, wsConn *WebSocketConnection) {
-	wsm.bufferMu.Lock()
-	buf, exists := wsm.executionNotificationBuffers[accountID]
-	if !exists {
-		buf = &ExecutionNotificationBuffer{accountID: accountID}
-		wsm.executionNotificationBuffers[accountID] = buf
-	}
-	wsm.bufferMu.Unlock()
-
-	buf.mu.Lock()
-	defer buf.mu.Unlock()
-
-	if buf.timer != nil {
-		buf.timer.Stop()
-	}
-	buf.executions = append(buf.executions, exec)
-	buf.timer = time.AfterFunc(5*time.Second, func() {
-		defer func() {
-			if r := recover(); r != nil {
-				fmt.Fprintf(os.Stderr, "[PANIC] flushExecutionNotificationBuffer (timer) para conta %d: %v\n", accountID, r)
-			}
-		}()
-		wsm.flushExecutionNotificationBuffer(accountID)
 	})
 }
 
@@ -2299,11 +1667,11 @@ func mergeWalletSnapshotRows(rows []WalletSnapshotRow) *WalletData {
 	return &base
 }
 
-func (wsm *WebSocketManager) processExecutionBuffer(accountID int64, wsConn *WebSocketConnection) {
+func (wsm *WebSocketManager) processWalletNotification(accountID int64, wsConn *WebSocketConnection) {
 	// Capturar panics
 	defer func() {
 		if r := recover(); r != nil {
-			fmt.Fprintf(os.Stderr, "[PANIC] processExecutionBuffer para conta %d: %v\n", accountID, r)
+			fmt.Fprintf(os.Stderr, "[PANIC] processWalletNotification para conta %d: %v\n", accountID, r)
 			func() {
 				defer func() {
 					if r2 := recover(); r2 != nil {
@@ -2312,7 +1680,7 @@ func (wsm *WebSocketManager) processExecutionBuffer(accountID int64, wsConn *Web
 				}()
 				logger, _ := getLogger(accountID, wsConn.Account.Name)
 				if logger != nil {
-					logger.Log("PANIC em processExecutionBuffer: %v", r)
+					logger.Log("PANIC em processWalletNotification: %v", r)
 				}
 			}()
 		}
@@ -2672,7 +2040,7 @@ func symbolToCoin(symbol string) string {
 	return symbol
 }
 
-// flushExecutions envia a lista de execuções para Discord e Google Sheets. Reaproveitado por flushExecutionNotificationBuffer e processDelayBuffer.
+// flushExecutions envia a lista de execuções para Discord e Google Sheets. Usado por processDelayBuffer.
 func (wsm *WebSocketManager) flushExecutions(wsConn *WebSocketConnection, executions []ExecutionData) {
 	if len(executions) == 0 {
 		return
@@ -2715,36 +2083,6 @@ func (wsm *WebSocketManager) flushExecutions(wsConn *WebSocketConnection, execut
 			}()
 		}
 	}
-}
-
-func (wsm *WebSocketManager) flushExecutionNotificationBuffer(accountID int64) {
-	wsm.mu.RLock()
-	conn, exists := wsm.connections[accountID]
-	if !exists || !conn.Running {
-		wsm.mu.RUnlock()
-		return
-	}
-	wsConn := conn
-	wsm.mu.RUnlock()
-
-	wsm.bufferMu.Lock()
-	buf, exists := wsm.executionNotificationBuffers[accountID]
-	if !exists {
-		wsm.bufferMu.Unlock()
-		return
-	}
-	buf.mu.Lock()
-	executions := make([]ExecutionData, len(buf.executions))
-	copy(executions, buf.executions)
-	buf.executions = buf.executions[:0]
-	if buf.timer != nil {
-		buf.timer.Stop()
-		buf.timer = nil
-	}
-	buf.mu.Unlock()
-	wsm.bufferMu.Unlock()
-
-	wsm.flushExecutions(wsConn, executions)
 }
 
 func (wsm *WebSocketManager) sendExecutionNotification(wsConn *WebSocketConnection, messageText string) {
