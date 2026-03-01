@@ -1323,8 +1323,16 @@ func (wsm *WebSocketManager) processStopOrder(wsConn *WebSocketConnection, order
 				oldPrice, _ := strconv.ParseFloat(existingOrder.TriggerPrice, 64)
 				newPrice, _ := strconv.ParseFloat(order.TriggerPrice, 64)
 
-				messageText := fmt.Sprintf("📝 %s Stop movido - %s %s%s %s\n   Preço: %s → %s (Qty: %s USD)",
-					stopIcon, order.Symbol, reducePrefix, order.Side, order.OrderType, formatPriceCoin(oldPrice), formatPriceCoin(newPrice), formatPriceCoin(qty))
+				formattedQty := formatPriceCoin(qty)
+
+				mensagemQty := "(Qty: " + formattedQty + " USD)"
+
+				if (formattedQty == "0") {
+					mensagemQty = "(Qty: 100% da posição)"
+				}
+
+				messageText := fmt.Sprintf("📝 %s Stop movido - %s %s%s %s\n   Preço: %s → %s %s",
+					stopIcon, order.Symbol, reducePrefix, order.Side, order.OrderType, formatPriceCoin(oldPrice), formatPriceCoin(newPrice), mensagemQty)
 
 				wsm.sendNotificationWithType(wsConn, messageText, true, false)
 				orderMoved = true
@@ -1376,9 +1384,17 @@ func (wsm *WebSocketManager) processStopOrder(wsConn *WebSocketConnection, order
 		stopIcon = "🔴" // Círculo vermelho para Sell
 	}
 
+	formattedQty := formatPriceCoin(qty)
+
+	mensagemQty := "(Qty: " + formattedQty + " USD)"
+
+	if (formattedQty == "0") {
+		mensagemQty = "(Qty: 100% da posição)"
+	}
+
 	// Formatar mensagem do stop
-	messageText := fmt.Sprintf("%s Stop %s%s %s - %s @ %s (Qty: %s USD)",
-		stopIcon, reducePrefix, order.Side, order.OrderType, order.Symbol, formatPriceCoin(triggerPrice), formatPriceCoin(qty))
+	messageText := fmt.Sprintf("%s Stop %s%s %s - %s @ %s %s",
+		stopIcon, reducePrefix, order.Side, order.OrderType, order.Symbol, formatPriceCoin(triggerPrice), mensagemQty)
 
 	// Enviar notificação imediatamente (ordem)
 	wsm.sendNotificationWithType(wsConn, messageText, true, false)
@@ -1427,9 +1443,17 @@ func (wsm *WebSocketManager) processStopCancellation(wsConn *WebSocketConnection
 		stopIcon = "🔴" // Círculo vermelho para Sell
 	}
 
+	formattedQty := formatPriceCoin(qty)
+
+	mensagemQty := "(Qty: " + formattedQty + " USD)"
+
+	if (formattedQty == "0") {
+		mensagemQty = "(Qty: 100% da posição)"
+	}
+
 	// Formatar mensagem do cancelamento de stop
-	messageText := fmt.Sprintf("❌ %s Stop %s%s %s **CANCELADO** - %s @ %s (Qty: %s USD)",
-		stopIcon, reducePrefix, order.Side, order.OrderType, order.Symbol, formatPriceCoin(triggerPrice), formatPriceCoin(qty))
+	messageText := fmt.Sprintf("❌ %s Stop %s%s %s **CANCELADO** - %s @ %s %s",
+		stopIcon, reducePrefix, order.Side, order.OrderType, order.Symbol, formatPriceCoin(triggerPrice), mensagemQty)
 
 	// Enviar notificação imediatamente (ordem)
 	wsm.sendNotificationWithType(wsConn, messageText, true, false)
