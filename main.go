@@ -329,6 +329,34 @@ func handleAddAccountCommon(manager *AccountManager, scanner *bufio.Scanner, pla
 		}
 	}
 
+	fmt.Print("Delay de notificação para ordens, stops e execuções (0=desligado, 3-20 segundos, Enter=desligado): ")
+	scanner.Scan()
+	delayInput := strings.TrimSpace(scanner.Text())
+	if delayInput == "cancelar" {
+		return
+	}
+	notificationDelaySeconds := 0
+	if delayInput != "" && delayInput != "0" {
+		var d int
+		if _, err := fmt.Sscanf(delayInput, "%d", &d); err == nil {
+			if d == 0 {
+				notificationDelaySeconds = 0
+			} else if d >= 3 && d <= 20 {
+				notificationDelaySeconds = d
+			} else {
+				fmt.Println("Erro: delay deve ser 0 ou um valor entre 3 e 20 segundos.")
+				fmt.Println("\nPressione Enter para voltar ao menu principal...")
+				scanner.Scan()
+				return
+			}
+		} else {
+			fmt.Println("Erro: valor inválido. Use 0 ou um número entre 3 e 20.")
+			fmt.Println("\nPressione Enter para voltar ao menu principal...")
+			scanner.Scan()
+			return
+		}
+	}
+
 	if nome == "" || apiKey == "" || apiSecret == "" {
 		fmt.Println("Erro: Nome, API Key e API Secret são obrigatórios!")
 		fmt.Println("\nPressione Enter para voltar ao menu principal...")
@@ -351,6 +379,7 @@ func handleAddAccountCommon(manager *AccountManager, scanner *bufio.Scanner, pla
 		SheetURLGoogleSheetsExecutions:  sheetURLGoogleSheetsExecutions,
 		Platform:                        platform,
 		Metadata:                        metadata,
+		NotificationDelaySeconds:        notificationDelaySeconds,
 	}
 
 	if err := manager.AddAccount(account); err != nil {
@@ -777,11 +806,46 @@ func handleEditAccount(manager *AccountManager, wsManager *WebSocketManager, sca
 		return
 	}
 
+	// Delay de notificação (0 = desligado, 3-20 segundos para agrupar)
+	currentDelay := account.NotificationDelaySeconds
+	currentDelayStr := "(desligado)"
+	if currentDelay > 0 {
+		currentDelayStr = fmt.Sprintf("%d segundos", currentDelay)
+	}
+	fmt.Printf("\nDelay de notificação atual (ordens, stops e execuções): %s\n", currentDelayStr)
+	fmt.Print("Novo valor (0=desligado, 3-20 segundos, Enter para manter): ")
+	scanner.Scan()
+	delayInput := strings.TrimSpace(scanner.Text())
+	if delayInput == "cancelar" {
+		return
+	}
+	newNotificationDelaySeconds := account.NotificationDelaySeconds
+	if delayInput != "" {
+		var d int
+		if _, err := fmt.Sscanf(delayInput, "%d", &d); err == nil {
+			if d == 0 {
+				newNotificationDelaySeconds = 0
+			} else if d >= 3 && d <= 20 {
+				newNotificationDelaySeconds = d
+			} else {
+				fmt.Println("Erro: delay deve ser 0 ou um valor entre 3 e 20 segundos.")
+				fmt.Println("\nPressione Enter para voltar ao menu principal...")
+				scanner.Scan()
+				return
+			}
+		} else {
+			fmt.Println("Erro: valor inválido. Use 0 ou um número entre 3 e 20.")
+			fmt.Println("\nPressione Enter para voltar ao menu principal...")
+			scanner.Scan()
+			return
+		}
+	}
+
 	// Verificar se a conta está sendo monitorada antes de editar
 	wasMonitored := wsManager.IsConnectionActive(account.ID)
 
 	// Atualizar conta (newMetadata == "" mantém o metadata atual)
-	if err := manager.UpdateAccount(account.ID, newName, newApiKey, newApiSecret, newWebhook, newMarkEveryoneOrder, newMarkEveryoneWallet, newWebhookURLGoogleSheets, newSheetURLGoogleSheets, newWebhookURLExecutions, newSheetURLGoogleSheetsExecutions, newMarkEveryoneExecution, newMetadata); err != nil {
+	if err := manager.UpdateAccount(account.ID, newName, newApiKey, newApiSecret, newWebhook, newMarkEveryoneOrder, newMarkEveryoneWallet, newWebhookURLGoogleSheets, newSheetURLGoogleSheets, newWebhookURLExecutions, newSheetURLGoogleSheetsExecutions, newMarkEveryoneExecution, newMetadata, newNotificationDelaySeconds); err != nil {
 		fmt.Printf("\nErro ao editar conta: %v\n", err)
 		fmt.Println("\nPressione Enter para voltar ao menu principal...")
 		scanner.Scan()

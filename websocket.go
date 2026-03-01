@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,16 +17,40 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+const delayBufferMaxUniqueItems = 50
+const orderGroupCreatedTimeWindowMs = 2000 // 2 segundos para agrupar ordens pelo createdTime
+
+// delayNotificationItem representa um item na lista de notificações do buffer de delay.
+type delayNotificationItem struct {
+	UpdatedTime      int64
+	NotificationType string     // "orders_group", "simple_order", "cancelled_order", "order_moved", "untriggered_stop", "deactivated_stop", "stop_moved"
+	Data             []OrderData
+	OldPrice         float64    // para order_moved e stop_moved
+	NewPrice         float64    // para order_moved e stop_moved
+}
+
 type WebSocketManager struct {
-	accountManager            *AccountManager
-	db                        *Database
-	connections               map[int64]*WebSocketConnection
-	mu                        sync.RWMutex
-	orderBuffers              map[int64]*OrderBuffer
-	cancelBuffers             map[int64]*CancelBuffer
-	executionBuffers          map[int64]*ExecutionBuffer
-	executionNotificationBuffers map[int64]*ExecutionNotificationBuffer
-	bufferMu                  sync.RWMutex
+	accountManager               *AccountManager
+	db                           *Database
+	connections                  map[int64]*WebSocketConnection
+	mu                           sync.RWMutex
+	orderBuffers                 map[int64]*OrderBuffer
+	cancelBuffers                map[int64]*CancelBuffer
+	executionBuffers             map[int64]*ExecutionBuffer
+	executionNotificationBuffers  map[int64]*ExecutionNotificationBuffer
+	delayBuffers                  map[int64]*DelayNotificationBuffer
+	bufferMu                     sync.RWMutex
+}
+
+// DelayNotificationBuffer acumula ordens, stops e execuções quando notification_delay_seconds > 0.
+type DelayNotificationBuffer struct {
+	orders      map[string][]OrderData // orderId -> versões ordenadas por updatedTime
+	stops       map[string][]OrderData // orderId -> versões ordenadas por updatedTime
+	executions  []ExecutionData
+	timer       *time.Timer
+	accountID   int64
+	delaySec    int
+	mu          sync.Mutex
 }
 
 type ExecutionNotificationBuffer struct {
@@ -172,7 +197,8 @@ func NewWebSocketManager(db *Database, accountManager *AccountManager) *WebSocke
 		orderBuffers:                 make(map[int64]*OrderBuffer),
 		cancelBuffers:                make(map[int64]*CancelBuffer),
 		executionBuffers:             make(map[int64]*ExecutionBuffer),
-		executionNotificationBuffers: make(map[int64]*ExecutionNotificationBuffer),
+		executionNotificationBuffers:  make(map[int64]*ExecutionNotificationBuffer),
+		delayBuffers:                 make(map[int64]*DelayNotificationBuffer),
 	}
 }
 
@@ -324,6 +350,14 @@ func (wsm *WebSocketManager) StopConnection(accountID int64) {
 		}
 		execNotifBuffer.mu.Unlock()
 		delete(wsm.executionNotificationBuffers, accountID)
+	}
+	if delayBuf, exists := wsm.delayBuffers[accountID]; exists {
+		delayBuf.mu.Lock()
+		if delayBuf.timer != nil {
+			delayBuf.timer.Stop()
+		}
+		delayBuf.mu.Unlock()
+		delete(wsm.delayBuffers, accountID)
 	}
 	wsm.bufferMu.Unlock()
 
@@ -736,6 +770,27 @@ func (wsm *WebSocketManager) handleOrderMessage(wsConn *WebSocketConnection, ord
 			continue
 		}
 
+		// Quando delay está ativo, enviar ordens e stops para o buffer unificado
+		if wsConn.Account.NotificationDelaySeconds > 0 {
+			if orderData.OrderStatus == "Untriggered" {
+				wsm.addStopToDelayBuffer(wsConn.AccountID, orderData, wsConn)
+				continue
+			}
+			if orderData.OrderStatus == "Deactivated" {
+				wsm.addStopToDelayBuffer(wsConn.AccountID, orderData, wsConn)
+				continue
+			}
+			if orderData.CreateType == "CreateByStopOrder" {
+				if logger != nil {
+					logger.Log("[DEBUG] Ordem ignorada - CreateByStopOrder (status: %s)", orderData.OrderStatus)
+				}
+				continue
+			}
+			// Todas as ordens (New, Filled, Cancelled, etc.) vão para o buffer de delay
+			wsm.addOrderToDelayBuffer(wsConn.AccountID, orderData, wsConn)
+			continue
+		}
+
 		// Processar stops Untriggered primeiro (sem delay)
 		if orderData.OrderStatus == "Untriggered" {
 			wsm.processStopOrder(wsConn, orderData)
@@ -893,6 +948,693 @@ func (wsm *WebSocketManager) addCancelToBuffer(accountID int64, order OrderData,
 	}
 }
 
+// formatOrderGroupMessage formata uma mensagem para um grupo de ordens (uma ou várias). Usado por processOrderBuffer e processDelayBuffer.
+func formatOrderGroupMessage(groupOrders []OrderData) string {
+	if len(groupOrders) == 0 {
+		return ""
+	}
+	firstOrder := groupOrders[0]
+	reducePrefix := ""
+	if firstOrder.ReduceOnly {
+		reducePrefix = "Reduce "
+	}
+	var minPrice, maxPrice float64
+	var totalQty float64
+	for i, order := range groupOrders {
+		priceStr := getDisplayPrice(order)
+		price, err := strconv.ParseFloat(priceStr, 64)
+		if err != nil {
+			continue
+		}
+		qty, err := strconv.ParseFloat(order.Qty, 64)
+		if err != nil {
+			continue
+		}
+		if i == 0 {
+			minPrice, maxPrice = price, price
+		} else {
+			if price < minPrice {
+				minPrice = price
+			}
+			if price > maxPrice {
+				maxPrice = price
+			}
+		}
+		totalQty += qty
+	}
+	displayPrice := getDisplayPrice(firstOrder)
+	var orderIcon string
+	if firstOrder.Side == "Buy" {
+		orderIcon = "🟢"
+	} else {
+		orderIcon = "🔴"
+	}
+	if len(groupOrders) == 1 {
+		return fmt.Sprintf("%s Nova ordem aberta - %s %s%s %s @ %s (Qty: %s USD)",
+			orderIcon, firstOrder.Symbol, reducePrefix, firstOrder.Side, firstOrder.OrderType, displayPrice, formatPriceCoin(totalQty))
+	}
+	if minPrice == maxPrice {
+		return fmt.Sprintf("%s %d ordens %s%s %s agrupadas - %s @ %s (Qty Total: %s USD)",
+			orderIcon, len(groupOrders), reducePrefix, firstOrder.Side, firstOrder.OrderType, firstOrder.Symbol, displayPrice, formatPriceCoin(totalQty))
+	}
+	return fmt.Sprintf("%s %d ordens %s%s %s agrupadas - %s\n   Range: %s até %s\n   Qty Total: %s USD",
+		orderIcon, len(groupOrders), reducePrefix, firstOrder.Side, firstOrder.OrderType, firstOrder.Symbol,
+		formatPriceCoin(minPrice), formatPriceCoin(maxPrice), formatPriceCoin(totalQty))
+}
+
+// formatOrderMovedMessage formata mensagem de ordem movida (preço alterado). Usado por processOrderBuffer e processDelayBuffer.
+func formatOrderMovedMessage(order OrderData, oldPrice, newPrice float64) string {
+	reducePrefix := ""
+	if order.ReduceOnly {
+		reducePrefix = "Reduce "
+	}
+	var orderIcon string
+	if order.Side == "Buy" {
+		orderIcon = "🟢"
+	} else {
+		orderIcon = "🔴"
+	}
+	qty, _ := strconv.ParseFloat(order.Qty, 64)
+	return fmt.Sprintf("📝 %s Ordem movida - %s %s%s %s\n   Preço: %s → %s (Qty: %s USD)",
+		orderIcon, order.Symbol, reducePrefix, order.Side, order.OrderType, formatPriceCoin(oldPrice), formatPriceCoin(newPrice), formatPriceCoin(qty))
+}
+
+// formatCancelMessage formata mensagem de cancelamentos agrupados.
+func formatCancelMessage(orders []OrderData) string {
+	if len(orders) == 0 {
+		return ""
+	}
+	parts := []string{fmt.Sprintf("❌ %d ordens canceladas:", len(orders))}
+	for _, order := range orders {
+		reducePrefix := ""
+		if order.ReduceOnly {
+			reducePrefix = "Reduce "
+		}
+		displayPrice := getDisplayPrice(order)
+		parts = append(parts, fmt.Sprintf("  • %s %s%s %s @ %s",
+			order.Symbol, reducePrefix, order.Side, order.OrderType, displayPrice))
+	}
+	return strings.Join(parts, "\n")
+}
+
+// formatStopOrderMessage formata mensagem de stop Untriggered.
+func formatStopOrderMessage(order OrderData) string {
+	reducePrefix := ""
+	if order.ReduceOnly {
+		reducePrefix = "Reduce "
+	}
+
+	// Converter triggerPrice e qty para float para formatação
+	triggerPrice, err := strconv.ParseFloat(order.TriggerPrice, 64)
+	if err != nil {
+		triggerPrice = 0
+	}
+
+	qty, err := strconv.ParseFloat(order.Qty, 64)
+	if err != nil {
+		qty = 0
+	}
+
+	formattedQty := formatPriceCoin(qty)
+	mensagemQty := "(Qty: " + formattedQty + " USD)"
+	if formattedQty == "0" {
+		mensagemQty = "(Qty: 100% da posição)"
+	}
+	var stopIcon string
+	if order.Side == "Buy" {
+		stopIcon = "🟢"
+	} else {
+		stopIcon = "🔴"
+	}
+	return fmt.Sprintf("%s Stop %s%s %s - %s @ %s %s",
+		stopIcon, reducePrefix, order.Side, order.OrderType, order.Symbol, formatPriceCoin(triggerPrice), mensagemQty)
+}
+
+// formatStopMovedMessage formata mensagem de stop movido (trigger price alterado). Usado por processStopOrder e processDelayBuffer.
+func formatStopMovedMessage(order OrderData, oldPrice, newPrice float64) string {
+	reducePrefix := ""
+	if order.ReduceOnly {
+		reducePrefix = "Reduce "
+	}
+	qty, _ := strconv.ParseFloat(order.Qty, 64)
+	formattedQty := formatPriceCoin(qty)
+	mensagemQty := "(Qty: " + formattedQty + " USD)"
+	if formattedQty == "0" {
+		mensagemQty = "(Qty: 100% da posição)"
+	}
+	var stopIcon string
+	if order.Side == "Buy" {
+		stopIcon = "🟢"
+	} else {
+		stopIcon = "🔴"
+	}
+	return fmt.Sprintf("📝 %s Stop movido - %s %s%s %s\n   Preço: %s → %s %s",
+		stopIcon, order.Symbol, reducePrefix, order.Side, order.OrderType, formatPriceCoin(oldPrice), formatPriceCoin(newPrice), mensagemQty)
+}
+
+// formatStopCancellationMessage formata mensagem de stop cancelado (Deactivated).
+func formatStopCancellationMessage(order OrderData) string {
+	reducePrefix := ""
+	if order.ReduceOnly {
+		reducePrefix = "Reduce "
+	}
+
+	// Converter triggerPrice e qty para float para formatação
+	triggerPrice, err := strconv.ParseFloat(order.TriggerPrice, 64)
+	if err != nil {
+		triggerPrice = 0
+	}
+
+	qty, err := strconv.ParseFloat(order.Qty, 64)
+	if err != nil {
+		qty = 0
+	}
+
+	formattedQty := formatPriceCoin(qty)
+	mensagemQty := "(Qty: " + formattedQty + " USD)"
+	if formattedQty == "0" {
+		mensagemQty = "(Qty: 100% da posição)"
+	}
+	var stopIcon string
+	if order.Side == "Buy" {
+		stopIcon = "🟢"
+	} else {
+		stopIcon = "🔴"
+	}
+	return fmt.Sprintf("❌ %s Stop %s%s %s **CANCELADO** - %s @ %s %s",
+		stopIcon, reducePrefix, order.Side, order.OrderType, order.Symbol, formatPriceCoin(triggerPrice), mensagemQty)
+}
+
+// sortOrderVersionsByUpdatedTime ordena in-place por updatedTime (ms) crescente.
+func sortOrderVersionsByUpdatedTime(versions []OrderData) {
+	if len(versions) <= 1 {
+		return
+	}
+	// sort.Slice
+	for i := 0; i < len(versions); i++ {
+		for j := i + 1; j < len(versions); j++ {
+			ti, _ := strconv.ParseInt(versions[i].UpdatedTime, 10, 64)
+			tj, _ := strconv.ParseInt(versions[j].UpdatedTime, 10, 64)
+			if ti > tj {
+				versions[i], versions[j] = versions[j], versions[i]
+			}
+		}
+	}
+}
+
+func (wsm *WebSocketManager) getOrCreateDelayBuffer(accountID int64, delaySec int) *DelayNotificationBuffer {
+	buf, exists := wsm.delayBuffers[accountID]
+	if !exists {
+		buf = &DelayNotificationBuffer{
+			orders:     make(map[string][]OrderData),
+			stops:      make(map[string][]OrderData),
+			executions: []ExecutionData{},
+			accountID:  accountID,
+			delaySec:   delaySec,
+		}
+		wsm.delayBuffers[accountID] = buf
+	}
+	return buf
+}
+
+func (wsm *WebSocketManager) addOrderToDelayBuffer(accountID int64, order OrderData, wsConn *WebSocketConnection) {
+	delaySec := wsConn.Account.NotificationDelaySeconds
+	if delaySec <= 0 {
+		return
+	}
+	wsm.bufferMu.Lock()
+	buf := wsm.getOrCreateDelayBuffer(accountID, delaySec)
+	wsm.bufferMu.Unlock()
+
+	buf.mu.Lock()
+	buf.orders[order.OrderID] = append(buf.orders[order.OrderID], order)
+	sortOrderVersionsByUpdatedTime(buf.orders[order.OrderID])
+	uniqueCount := len(buf.orders) + len(buf.stops) + len(buf.executions)
+	if buf.timer != nil {
+		buf.timer.Stop()
+		buf.timer = nil
+	}
+	if uniqueCount >= delayBufferMaxUniqueItems {
+		buf.mu.Unlock()
+		go wsm.processDelayBuffer(accountID, wsConn)
+		return
+	}
+	buf.timer = time.AfterFunc(time.Duration(delaySec)*time.Second, func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Fprintf(os.Stderr, "[PANIC] processDelayBuffer (timer) para conta %d: %v\n", accountID, r)
+			}
+		}()
+		wsm.processDelayBuffer(accountID, wsConn)
+	})
+	buf.mu.Unlock()
+}
+
+func (wsm *WebSocketManager) addStopToDelayBuffer(accountID int64, order OrderData, wsConn *WebSocketConnection) {
+	delaySec := wsConn.Account.NotificationDelaySeconds
+	if delaySec <= 0 {
+		return
+	}
+	wsm.bufferMu.Lock()
+	buf := wsm.getOrCreateDelayBuffer(accountID, delaySec)
+	wsm.bufferMu.Unlock()
+
+	buf.mu.Lock()
+	buf.stops[order.OrderID] = append(buf.stops[order.OrderID], order)
+	sortOrderVersionsByUpdatedTime(buf.stops[order.OrderID])
+	uniqueCount := len(buf.orders) + len(buf.stops) + len(buf.executions)
+	if buf.timer != nil {
+		buf.timer.Stop()
+		buf.timer = nil
+	}
+	if uniqueCount >= delayBufferMaxUniqueItems {
+		buf.mu.Unlock()
+		go wsm.processDelayBuffer(accountID, wsConn)
+		return
+	}
+	buf.timer = time.AfterFunc(time.Duration(delaySec)*time.Second, func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Fprintf(os.Stderr, "[PANIC] processDelayBuffer (timer) para conta %d: %v\n", accountID, r)
+			}
+		}()
+		wsm.processDelayBuffer(accountID, wsConn)
+	})
+	buf.mu.Unlock()
+}
+
+func (wsm *WebSocketManager) addExecutionToDelayBuffer(accountID int64, exec ExecutionData, wsConn *WebSocketConnection) {
+	delaySec := wsConn.Account.NotificationDelaySeconds
+	if delaySec <= 0 {
+		return
+	}
+	wsm.bufferMu.Lock()
+	buf := wsm.getOrCreateDelayBuffer(accountID, delaySec)
+	wsm.bufferMu.Unlock()
+
+	buf.mu.Lock()
+	buf.executions = append(buf.executions, exec)
+	uniqueCount := len(buf.orders) + len(buf.stops) + len(buf.executions)
+	if buf.timer != nil {
+		buf.timer.Stop()
+		buf.timer = nil
+	}
+	if uniqueCount >= delayBufferMaxUniqueItems {
+		buf.mu.Unlock()
+		go wsm.processDelayBuffer(accountID, wsConn)
+		return
+	}
+	buf.timer = time.AfterFunc(time.Duration(delaySec)*time.Second, func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Fprintf(os.Stderr, "[PANIC] processDelayBuffer (timer) para conta %d: %v\n", accountID, r)
+			}
+		}()
+		wsm.processDelayBuffer(accountID, wsConn)
+	})
+	buf.mu.Unlock()
+}
+
+// processDelayBuffer processa o buffer de delay (cópia, reset, depois regras 1-10). Deve ser chamado com buffer já liberado.
+func (wsm *WebSocketManager) processDelayBuffer(accountID int64, wsConn *WebSocketConnection) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "[PANIC] processDelayBuffer para conta %d: %v\n", accountID, r)
+		}
+	}()
+
+	wsm.mu.RLock()
+	conn, exists := wsm.connections[accountID]
+	if !exists || !conn.Running {
+		wsm.mu.RUnlock()
+		return
+	}
+	wsConn = conn
+	wsm.mu.RUnlock()
+
+	wsm.bufferMu.Lock()
+	buf, exists := wsm.delayBuffers[accountID]
+	if !exists {
+		wsm.bufferMu.Unlock()
+		return
+	}
+	buf.mu.Lock()
+	// 1. Cópia e reset
+	ordersCopy := make(map[string][]OrderData)
+	for k, v := range buf.orders {
+		vers := make([]OrderData, len(v))
+		copy(vers, v)
+		ordersCopy[k] = vers
+	}
+	stopsCopy := make(map[string][]OrderData)
+	for k, v := range buf.stops {
+		vers := make([]OrderData, len(v))
+		copy(vers, v)
+		stopsCopy[k] = vers
+	}
+	executionsCopy := make([]ExecutionData, len(buf.executions))
+	copy(executionsCopy, buf.executions)
+	buf.orders = make(map[string][]OrderData)
+	buf.stops = make(map[string][]OrderData)
+	buf.executions = nil
+	if buf.timer != nil {
+		buf.timer.Stop()
+		buf.timer = nil
+	}
+	buf.mu.Unlock()
+	wsm.bufferMu.Unlock()
+
+	// Regra 1: ordens preparadas + movedOrderIDs + movedOrderPrices (para formatOrderMovedMessage no delay buffer)
+	var preparedOrders []OrderData
+	movedOrderIDs := make(map[string]bool)
+	movedOrderPrices := make(map[string]struct{ Old, New float64 })
+	for _, versions := range ordersCopy {
+		sortOrderVersionsByUpdatedTime(versions)
+
+		oldest, newest := versions[0], versions[len(versions)-1]
+
+		existingOrderJSON, _ := wsm.accountManager.GetOrder(oldest.OrderID)
+		var existingOrder OrderData
+		hasExistingOrder := false
+		if existingOrderJSON != "" {
+			if json.Unmarshal([]byte(existingOrderJSON), &existingOrder) == nil {
+				hasExistingOrder = true
+			}
+		}
+
+		if oldest.OrderStatus == "New" && newest.OrderStatus == "Cancelled" {
+			if hasExistingOrder {
+				// caso onde foi cancelado mas antes moveu a ordem por algum motivo, notificar a ordem movida e o cancelamento
+				prevOrder := versions[len(versions)-2]
+				if getDisplayPrice(existingOrder) != getDisplayPrice(prevOrder) {
+					if o, errO := strconv.ParseFloat(getDisplayPrice(existingOrder), 64); errO == nil {
+						if n, errN := strconv.ParseFloat(getDisplayPrice(prevOrder), 64); errN == nil {
+							movedOrderIDs[prevOrder.OrderID] = true
+							movedOrderPrices[prevOrder.OrderID] = struct{ Old, New float64 }{o, n}
+							preparedOrders = append(preparedOrders, prevOrder)
+						}
+					}
+				}
+				preparedOrders = append(preparedOrders, newest)
+				continue
+			} else {
+				continue
+			}
+		}
+
+		// Processar abertura de ordem ou cancelamento
+		// Verificar se é Limit executada rapidamente (até 3 segundos entre criação e atualização)
+		// Verificar se a ordem Limit foi movida para outro preço
+		if newest.OrderType == "Limit" && (newest.OrderStatus == "Filled" || newest.OrderStatus == "PartiallyFilled") {
+			isLimitExecutedQuickly := false
+			isLimitMoved := false
+
+			createdTime, err1 := strconv.ParseInt(newest.CreatedTime, 10, 64)
+			updatedTime, err2 := strconv.ParseInt(newest.UpdatedTime, 10, 64)
+			if err1 == nil && err2 == nil {
+				timeDiff := updatedTime - createdTime
+				if timeDiff >= 0 && timeDiff <= 3000 { // Diferença de até 3 segundos (3000ms)
+					isLimitExecutedQuickly = true
+				}
+			}
+
+			if hasExistingOrder {
+				oldPriceStr := getDisplayPrice(existingOrder)
+				newPriceStr := getDisplayPrice(newest)
+				if oldPriceStr != newPriceStr {
+					isLimitMoved = true
+					movedOrderIDs[newest.OrderID] = true
+					if o, errO := strconv.ParseFloat(oldPriceStr, 64); errO == nil {
+						if n, errN := strconv.ParseFloat(newPriceStr, 64); errN == nil {
+							movedOrderPrices[newest.OrderID] = struct{ Old, New float64 }{o, n}
+						}
+					}
+				}
+			}
+
+			if isLimitExecutedQuickly || isLimitMoved {
+				preparedOrders = append(preparedOrders, newest)
+			}
+
+			continue
+		}
+
+		if oldest.OrderStatus == "New" && newest.OrderStatus == "New" {
+			if hasExistingOrder && getDisplayPrice(existingOrder) != getDisplayPrice(newest) {
+				movedOrderIDs[newest.OrderID] = true
+				if o, errO := strconv.ParseFloat(getDisplayPrice(existingOrder), 64); errO == nil {
+					if n, errN := strconv.ParseFloat(getDisplayPrice(newest), 64); errN == nil {
+						movedOrderPrices[newest.OrderID] = struct{ Old, New float64 }{o, n}
+					}
+				}
+			} else if !hasExistingOrder && getDisplayPrice(oldest) != getDisplayPrice(newest) {
+				movedOrderIDs[newest.OrderID] = true
+			}
+		}
+
+		preparedOrders = append(preparedOrders, newest)
+	}
+
+	// Regra 2: stops preparados + stopMovedPrices (para formatStopMovedMessage no delay buffer)
+	var preparedStops []OrderData
+	stopMovedPrices := make(map[string]struct{ Old, New float64 })
+	for _, versions := range stopsCopy {
+		sortOrderVersionsByUpdatedTime(versions)
+		oldest, newest := versions[0], versions[len(versions)-1]
+
+		existingStopOrderJSON, _ := wsm.accountManager.GetOrder(oldest.OrderID)
+		var existingStopOrder OrderData
+		hasExistingStopOrder := false
+		if existingStopOrderJSON != "" {
+			if json.Unmarshal([]byte(existingStopOrderJSON), &existingStopOrder) == nil {
+				hasExistingStopOrder = true
+			}
+		}
+
+		if oldest.OrderStatus == "Untriggered" && newest.OrderStatus == "Deactivated" {
+			if hasExistingStopOrder {
+				prevStop := versions[len(versions)-2]
+				if existingStopOrder.TriggerPrice != prevStop.TriggerPrice {
+					if o, errO := strconv.ParseFloat(existingStopOrder.TriggerPrice, 64); errO == nil {
+						if n, errN := strconv.ParseFloat(prevStop.TriggerPrice, 64); errN == nil {
+							stopMovedPrices[prevStop.OrderID] = struct{ Old, New float64 }{o, n}
+							preparedStops = append(preparedStops, prevStop)
+						}
+					}
+				}
+				preparedStops = append(preparedStops, newest)
+				continue
+			} else {
+				continue
+			}
+		}
+
+		// Várias versões todas Untriggered: verificar se trigger price mudou (stop movido)
+		if oldest.OrderStatus == "Untriggered" && newest.OrderStatus == "Untriggered" && hasExistingStopOrder && existingStopOrder.TriggerPrice != newest.TriggerPrice {
+			if o, errO := strconv.ParseFloat(existingStopOrder.TriggerPrice, 64); errO == nil {
+				if n, errN := strconv.ParseFloat(newest.TriggerPrice, 64); errN == nil {
+					stopMovedPrices[newest.OrderID] = struct{ Old, New float64 }{o, n}
+				}
+			}
+		}
+		preparedStops = append(preparedStops, newest)
+	}
+
+	// Regra 4: lista de notificações de ordens (ordenar por updatedTime, agrupar por 2s createdTime)
+	sort.Slice(preparedOrders, func(i, j int) bool {
+		ti, _ := strconv.ParseInt(preparedOrders[i].UpdatedTime, 10, 64)
+		tj, _ := strconv.ParseInt(preparedOrders[j].UpdatedTime, 10, 64)
+		return ti < tj
+	})
+	var orderNotifications []delayNotificationItem
+	for i := 0; i < len(preparedOrders); {
+		order := preparedOrders[i]
+		orderUpdatedTime, _ := strconv.ParseInt(order.UpdatedTime, 10, 64)
+		orderCreatedTime, _ := strconv.ParseInt(order.CreatedTime, 10, 64)
+
+		if order.OrderStatus == "Cancelled" {
+			orderNotifications = append(orderNotifications, delayNotificationItem{
+				UpdatedTime:      orderUpdatedTime,
+				NotificationType: "cancelled_order",
+				Data:             []OrderData{order},
+			})
+			i++
+			continue
+		}
+
+		if movedOrderIDs[order.OrderID] {
+			item := delayNotificationItem{UpdatedTime: orderUpdatedTime, Data: []OrderData{order}}
+			if prices, ok := movedOrderPrices[order.OrderID]; ok {
+				item.NotificationType = "order_moved"
+				item.OldPrice = prices.Old
+				item.NewPrice = prices.New
+			} else {
+				item.NotificationType = "simple_order"
+			}
+			orderNotifications = append(orderNotifications, item)
+			i++
+			continue
+		}
+
+		// Tentar agrupar com ordens seguintes (mesmo Symbol, ReduceOnly, Side, OrderType e createdTime dentro de 2s)
+		group := []OrderData{order}
+		minUpdated := orderUpdatedTime
+		j := i + 1
+		for j < len(preparedOrders) {
+			next := preparedOrders[j]
+			if next.OrderStatus == "Cancelled" || movedOrderIDs[next.OrderID] {
+				break
+			}
+			orderReduce := ""
+			if order.ReduceOnly {
+				orderReduce = "Reduce"
+			}
+			nextReduce := ""
+			if next.ReduceOnly {
+				nextReduce = "Reduce"
+			}
+			orderKey := fmt.Sprintf("%s_%s_%s_%s", order.Symbol, orderReduce, order.Side, order.OrderType)
+			nextKey := fmt.Sprintf("%s_%s_%s_%s", next.Symbol, nextReduce, next.Side, next.OrderType)
+			if nextKey != orderKey {
+				break
+			}
+			nextCreated, _ := strconv.ParseInt(next.CreatedTime, 10, 64)
+			if nextCreated < orderCreatedTime || nextCreated > orderCreatedTime+orderGroupCreatedTimeWindowMs {
+				// fora da janela 2s a partir da primeira do grupo
+				break
+			}
+			group = append(group, next)
+			nu, _ := strconv.ParseInt(next.UpdatedTime, 10, 64)
+			if nu < minUpdated {
+				minUpdated = nu
+			}
+			j++
+		}
+
+		if len(group) == 1 {
+			orderNotifications = append(orderNotifications, delayNotificationItem{
+				UpdatedTime:      orderUpdatedTime,
+				NotificationType: "simple_order",
+				Data:             group,
+			})
+		} else {
+			orderNotifications = append(orderNotifications, delayNotificationItem{
+				UpdatedTime:      minUpdated,
+				NotificationType: "orders_group",
+				Data:             group,
+			})
+		}
+		i = j
+	}
+
+	// Regra 5: adicionar stops à lista (ignorar triggerPrice 0)
+	for _, stop := range preparedStops {
+		triggerPrice, _ := strconv.ParseFloat(stop.TriggerPrice, 64)
+		if triggerPrice == 0 {
+			continue
+		}
+		uTime, _ := strconv.ParseInt(stop.UpdatedTime, 10, 64)
+		if stop.OrderStatus == "Deactivated" {
+			orderNotifications = append(orderNotifications, delayNotificationItem{
+				UpdatedTime:      uTime,
+				NotificationType: "deactivated_stop",
+				Data:             []OrderData{stop},
+			})
+		} else if prices, ok := stopMovedPrices[stop.OrderID]; ok {
+			item := delayNotificationItem{
+				UpdatedTime:      uTime,
+				NotificationType: "stop_moved",
+				Data:             []OrderData{stop},
+			}
+
+			item.OldPrice = prices.Old
+			item.NewPrice = prices.New
+			
+			orderNotifications = append(orderNotifications, item)
+		} else {
+			orderNotifications = append(orderNotifications, delayNotificationItem{
+				UpdatedTime:      uTime,
+				NotificationType: "untriggered_stop",
+				Data:             []OrderData{stop},
+			})
+		}
+	}
+
+	// Regra 6: ordenar lista por updatedTime
+	sort.Slice(orderNotifications, func(i, j int) bool {
+		return orderNotifications[i].UpdatedTime < orderNotifications[j].UpdatedTime
+	})
+
+	// Regra 7: agrupar cancelled_order consecutivos
+	for i := 0; i < len(orderNotifications); i++ {
+		if orderNotifications[i].NotificationType != "cancelled_order" || len(orderNotifications[i].Data) == 0 {
+			continue
+		}
+		merged := orderNotifications[i].Data
+		for j := i + 1; j < len(orderNotifications) && orderNotifications[j].NotificationType == "cancelled_order"; j++ {
+			merged = append(merged, orderNotifications[j].Data...)
+			orderNotifications[j].Data = nil
+		}
+		orderNotifications[i].Data = merged
+	}
+
+	// Atualizar banco: ordens e stops
+	for _, item := range orderNotifications {
+		for _, o := range item.Data {
+			orderJSON, _ := json.Marshal(o)
+			if item.NotificationType == "cancelled_order" || item.NotificationType == "deactivated_stop" {
+				_ = wsm.accountManager.DeleteOrder(o.OrderID)
+			} else if item.NotificationType == "untriggered_stop" || item.NotificationType == "simple_order" || item.NotificationType == "orders_group" || item.NotificationType == "order_moved" || item.NotificationType == "stop_moved" {
+				if o.OrderStatus != "Filled" && o.OrderStatus != "PartiallyFilled" {
+					_ = wsm.accountManager.SaveOrder(o.OrderID, accountID, string(orderJSON))
+				} else {
+					_ = wsm.accountManager.DeleteOrder(o.OrderID)
+				}
+			}
+		}
+	}
+
+	// Regra 8 e 9: montar texto e enviar uma mensagem
+	var parts []string
+	for _, item := range orderNotifications {
+		if len(item.Data) == 0 {
+			continue
+		}
+		switch item.NotificationType {
+		case "orders_group", "simple_order":
+			parts = append(parts, formatOrderGroupMessage(item.Data))
+		case "order_moved":
+			parts = append(parts, formatOrderMovedMessage(item.Data[0], item.OldPrice, item.NewPrice))
+		case "cancelled_order":
+			var toNotify []OrderData
+			for _, o := range item.Data {
+				if hasValidDisplayPrice(o) {
+					toNotify = append(toNotify, o)
+				}
+			}
+			if len(toNotify) > 0 {
+				parts = append(parts, formatCancelMessage(toNotify))
+			}
+		case "untriggered_stop":
+			parts = append(parts, formatStopOrderMessage(item.Data[0]))
+		case "stop_moved":
+			parts = append(parts, formatStopMovedMessage(item.Data[0], item.OldPrice, item.NewPrice))
+		case "deactivated_stop":
+			parts = append(parts, formatStopCancellationMessage(item.Data[0]))
+		}
+	}
+	if len(parts) > 0 {
+		messageText := strings.Join(parts, "\n\n")
+		wsm.sendNotificationWithType(wsConn, messageText, true, false)
+	}
+
+	// Regra 10: execuções (delay para notificação de ordens chegar ao Discord antes)
+	if len(executionsCopy) > 0 {
+		time.Sleep(2 * time.Second)
+		wsm.flushExecutions(wsConn, executionsCopy)
+	}
+}
+
 func (wsm *WebSocketManager) processOrderBuffer(accountID int64, wsConn *WebSocketConnection) {
 	// Capturar panics
 	defer func() {
@@ -1017,33 +1759,10 @@ func (wsm *WebSocketManager) processOrderBuffer(accountID int64, wsConn *WebSock
 					oldPrice, errOld := strconv.ParseFloat(oldPriceStr, 64)
 					newPrice, errNew := strconv.ParseFloat(newPriceStr, 64)
 					// Só notificar "ordem movida" se ambos os preços forem diferentes de 0
-					if errOld != nil || errNew != nil || oldPrice == 0 || newPrice == 0 {
-						// Salvar no banco abaixo; não marcar como movida
-					} else {
-						// Preço mudou - criar notificação especial
-						reducePrefix := ""
-						if order.ReduceOnly {
-							reducePrefix = "Reduce "
-						}
-
-						var orderIcon string
-						if order.Side == "Buy" {
-							orderIcon = "🟢"
-						} else {
-							orderIcon = "🔴"
-						}
-
-						qty, err := strconv.ParseFloat(order.Qty, 64)
-						if err != nil {
-							continue
-						}
-
-						messageText := fmt.Sprintf("📝 %s Ordem movida - %s %s%s %s\n   Preço: %s → %s (Qty: %s USD)",
-							orderIcon, order.Symbol, reducePrefix, order.Side, order.OrderType, formatPriceCoin(oldPrice), formatPriceCoin(newPrice), formatPriceCoin(qty))
-
+					if errOld == nil && errNew == nil && oldPrice != 0 && newPrice != 0 {
+						messageText := formatOrderMovedMessage(order, oldPrice, newPrice)
 						wsm.sendNotificationWithType(wsConn, messageText, true, false)
 						movedOrders[order.OrderID] = true
-
 						logger, _ := getLogger(accountID, wsConn.Account.Name)
 						if logger != nil {
 							logger.Log("[DEBUG] Ordem %s movida de %.2f para %.2f", order.OrderID, oldPrice, newPrice)
@@ -1104,77 +1823,10 @@ func (wsm *WebSocketManager) processOrderBuffer(accountID int64, wsConn *WebSock
 		if len(groupOrders) == 0 {
 			continue
 		}
-
-		// Pegar informações do primeiro para usar como base
-		firstOrder := groupOrders[0]
-		reducePrefix := ""
-		if firstOrder.ReduceOnly {
-			reducePrefix = "Reduce "
+		messageText := formatOrderGroupMessage(groupOrders)
+		if messageText == "" {
+			continue
 		}
-
-		// Calcular range de preços e quantidade total
-		var minPrice, maxPrice float64
-		var totalQty float64
-
-		for i, order := range groupOrders {
-			// Usar avgPrice se for Market, senão usar Price
-			priceStr := getDisplayPrice(order)
-			price, err := strconv.ParseFloat(priceStr, 64)
-			if err != nil {
-				// Erro ao parsear preço - pular esta ordem
-				continue
-			}
-			qty, err := strconv.ParseFloat(order.Qty, 64)
-			if err != nil {
-				// Erro ao parsear quantidade - pular esta ordem
-				continue
-			}
-
-			if i == 0 {
-				minPrice = price
-				maxPrice = price
-			} else {
-				if price < minPrice {
-					minPrice = price
-				}
-				if price > maxPrice {
-					maxPrice = price
-				}
-			}
-			totalQty += qty
-		}
-
-		// Obter preço de exibição para a primeira ordem
-		displayPrice := getDisplayPrice(firstOrder)
-
-		var orderIcon string
-		if firstOrder.Side == "Buy" {
-			orderIcon = "🟢" // Círculo verde para Buy
-		} else {
-			orderIcon = "🔴" // Círculo vermelho para Sell
-		}
-
-		// Construir mensagem
-		var messageText string
-		if len(groupOrders) == 1 {
-			// Uma única ordem
-			messageText = fmt.Sprintf("%s Nova ordem aberta - %s %s%s %s @ %s (Qty: %s USD)",
-				orderIcon, firstOrder.Symbol, reducePrefix, firstOrder.Side, firstOrder.OrderType, displayPrice, formatPriceCoin(totalQty))
-		} else {
-			// Múltiplas ordens agrupadas (scale orders)
-			if minPrice == maxPrice {
-				// Todas no mesmo preço
-				messageText = fmt.Sprintf("%s %d ordens %s%s %s agrupadas - %s @ %s (Qty Total: %s USD)",
-					orderIcon, len(groupOrders), reducePrefix, firstOrder.Side, firstOrder.OrderType, firstOrder.Symbol, displayPrice, formatPriceCoin(totalQty))
-			} else {
-				// Range de preços
-				messageText = fmt.Sprintf("%s %d ordens %s%s %s agrupadas - %s\n   Range: %s até %s\n   Qty Total: %s USD",
-					orderIcon, len(groupOrders), reducePrefix, firstOrder.Side, firstOrder.OrderType, firstOrder.Symbol,
-					formatPriceCoin(minPrice), formatPriceCoin(maxPrice), formatPriceCoin(totalQty))
-			}
-		}
-
-		// Enviar notificação (ordem)
 		wsm.sendNotificationWithType(wsConn, messageText, true, false)
 		logger, _ := getLogger(accountID, wsConn.Account.Name)
 		if logger != nil {
@@ -1264,21 +1916,10 @@ func (wsm *WebSocketManager) processCancelBuffer(accountID int64, wsConn *WebSoc
 		return
 	}
 
-	// Construir mensagem agrupada
-	messageParts := []string{fmt.Sprintf("❌ %d ordens canceladas:", len(ordersToNotify))}
-	for _, order := range ordersToNotify {
-		reducePrefix := ""
-		if order.ReduceOnly {
-			reducePrefix = "Reduce "
-		}
-		displayPrice := getDisplayPrice(order)
-		messageParts = append(messageParts, fmt.Sprintf("  • %s %s%s %s @ %s",
-			order.Symbol, reducePrefix, order.Side, order.OrderType, displayPrice))
+	messageText := formatCancelMessage(ordersToNotify)
+	if messageText == "" {
+		return
 	}
-
-	messageText := strings.Join(messageParts, "\n")
-
-	// Enviar notificação (ordem)
 	wsm.sendNotificationWithType(wsConn, messageText, true, false)
 	logger, _ := getLogger(accountID, wsConn.Account.Name)
 	if logger != nil {
@@ -1299,44 +1940,18 @@ func (wsm *WebSocketManager) processStopOrder(wsConn *WebSocketConnection, order
 		triggerPrice = 0
 	}
 
-	qty, err := strconv.ParseFloat(order.Qty, 64)
-	if err != nil {
-		qty = 0
-	}
-
 	// Verificar se stop já existe no banco e detectar mudança de preço
 	existingOrderJSON, err := wsm.accountManager.GetOrder(order.OrderID)
 	orderMoved := false
 	if err == nil && existingOrderJSON != "" {
-		// Stop existe, verificar se o triggerPrice mudou
 		var existingOrder OrderData
 		if err := json.Unmarshal([]byte(existingOrderJSON), &existingOrder); err == nil {
-			// Comparar triggerPrice; só notificar "stop movido" se triggerPrice != 0
 			if existingOrder.TriggerPrice != order.TriggerPrice && triggerPrice != 0 {
-				var stopIcon string
-				if order.Side == "Buy" {
-					stopIcon = "🟢"
-				} else {
-					stopIcon = "🔴"
-				}
-
 				oldPrice, _ := strconv.ParseFloat(existingOrder.TriggerPrice, 64)
 				newPrice, _ := strconv.ParseFloat(order.TriggerPrice, 64)
-
-				formattedQty := formatPriceCoin(qty)
-
-				mensagemQty := "(Qty: " + formattedQty + " USD)"
-
-				if (formattedQty == "0") {
-					mensagemQty = "(Qty: 100% da posição)"
-				}
-
-				messageText := fmt.Sprintf("📝 %s Stop movido - %s %s%s %s\n   Preço: %s → %s %s",
-					stopIcon, order.Symbol, reducePrefix, order.Side, order.OrderType, formatPriceCoin(oldPrice), formatPriceCoin(newPrice), mensagemQty)
-
+				messageText := formatStopMovedMessage(order, oldPrice, newPrice)
 				wsm.sendNotificationWithType(wsConn, messageText, true, false)
 				orderMoved = true
-
 				logger, _ := getLogger(wsConn.AccountID, wsConn.Account.Name)
 				if logger != nil {
 					logger.Log("[DEBUG] Stop %s movido de %.2f para %.2f", order.OrderID, oldPrice, newPrice)
@@ -1376,27 +1991,7 @@ func (wsm *WebSocketManager) processStopOrder(wsConn *WebSocketConnection, order
 		return
 	}
 
-	// Escolher ícone baseado no Side (Buy = verde, Sell = vermelho)
-	var stopIcon string
-	if order.Side == "Buy" {
-		stopIcon = "🟢" // Círculo verde para Buy
-	} else {
-		stopIcon = "🔴" // Círculo vermelho para Sell
-	}
-
-	formattedQty := formatPriceCoin(qty)
-
-	mensagemQty := "(Qty: " + formattedQty + " USD)"
-
-	if (formattedQty == "0") {
-		mensagemQty = "(Qty: 100% da posição)"
-	}
-
-	// Formatar mensagem do stop
-	messageText := fmt.Sprintf("%s Stop %s%s %s - %s @ %s %s",
-		stopIcon, reducePrefix, order.Side, order.OrderType, order.Symbol, formatPriceCoin(triggerPrice), mensagemQty)
-
-	// Enviar notificação imediatamente (ordem)
+	messageText := formatStopOrderMessage(order)
 	wsm.sendNotificationWithType(wsConn, messageText, true, false)
 	logger, _ := getLogger(wsConn.AccountID, wsConn.Account.Name)
 	if logger != nil {
@@ -1405,6 +2000,14 @@ func (wsm *WebSocketManager) processStopOrder(wsConn *WebSocketConnection, order
 }
 
 func (wsm *WebSocketManager) processStopCancellation(wsConn *WebSocketConnection, order OrderData) {
+	// Remover stop do banco se existir
+	if err := wsm.accountManager.DeleteOrder(order.OrderID); err != nil {
+		logger, _ := getLogger(wsConn.AccountID, wsConn.Account.Name)
+		if logger != nil {
+			logger.Log("[DEBUG] Erro ao remover stop %s do banco: %v", order.OrderID, err)
+		}
+	}
+
 	// Processar cancelamento de stop não triggerado imediatamente (sem delay)
 	reducePrefix := ""
 	if order.ReduceOnly {
@@ -1417,45 +2020,12 @@ func (wsm *WebSocketManager) processStopCancellation(wsConn *WebSocketConnection
 		triggerPrice = 0
 	}
 
-	qty, err := strconv.ParseFloat(order.Qty, 64)
-	if err != nil {
-		qty = 0
-	}
-
-	// Remover stop do banco se existir
-	if err := wsm.accountManager.DeleteOrder(order.OrderID); err != nil {
-		logger, _ := getLogger(wsConn.AccountID, wsConn.Account.Name)
-		if logger != nil {
-			logger.Log("[DEBUG] Erro ao remover stop %s do banco: %v", order.OrderID, err)
-		}
-	}
-
 	// Se triggerPrice for 0, cancelar notificação
 	if triggerPrice == 0 {
 		return
 	}
 
-	// Escolher ícone baseado no Side (Buy = verde, Sell = vermelho)
-	var stopIcon string
-	if order.Side == "Buy" {
-		stopIcon = "🟢" // Círculo verde para Buy
-	} else {
-		stopIcon = "🔴" // Círculo vermelho para Sell
-	}
-
-	formattedQty := formatPriceCoin(qty)
-
-	mensagemQty := "(Qty: " + formattedQty + " USD)"
-
-	if (formattedQty == "0") {
-		mensagemQty = "(Qty: 100% da posição)"
-	}
-
-	// Formatar mensagem do cancelamento de stop
-	messageText := fmt.Sprintf("❌ %s Stop %s%s %s **CANCELADO** - %s @ %s %s",
-		stopIcon, reducePrefix, order.Side, order.OrderType, order.Symbol, formatPriceCoin(triggerPrice), mensagemQty)
-
-	// Enviar notificação imediatamente (ordem)
+	messageText := formatStopCancellationMessage(order)
 	wsm.sendNotificationWithType(wsConn, messageText, true, false)
 	logger, _ := getLogger(wsConn.AccountID, wsConn.Account.Name)
 	if logger != nil {
@@ -1514,8 +2084,12 @@ func (wsm *WebSocketManager) handleExecutionMessage(wsConn *WebSocketConnection,
 
 		// Adicionar ao buffer de execution (inicia/reseta timer de 15 minutos)
 		wsm.addExecutionToBuffer(wsConn.AccountID, wsConn)
-		// Adicionar ao buffer de notificação de execuções (5s: Discord + Google Sheets)
-		wsm.addExecutionToNotificationBuffer(wsConn.AccountID, execData, wsConn)
+		// Com delay ativo: buffer unificado; senão: buffer de notificação 5s
+		if wsConn.Account.NotificationDelaySeconds > 0 {
+			wsm.addExecutionToDelayBuffer(wsConn.AccountID, execData, wsConn)
+		} else {
+			wsm.addExecutionToNotificationBuffer(wsConn.AccountID, execData, wsConn)
+		}
 	}
 }
 
@@ -2098,6 +2672,51 @@ func symbolToCoin(symbol string) string {
 	return symbol
 }
 
+// flushExecutions envia a lista de execuções para Discord e Google Sheets. Reaproveitado por flushExecutionNotificationBuffer e processDelayBuffer.
+func (wsm *WebSocketManager) flushExecutions(wsConn *WebSocketConnection, executions []ExecutionData) {
+	if len(executions) == 0 {
+		return
+	}
+	logger, _ := getLogger(wsConn.AccountID, wsConn.Account.Name)
+
+	if wsConn.Account.WebhookURLExecutions != "" {
+		var parts []string
+		for _, e := range executions {
+			coin := symbolToCoin(e.Symbol)
+			price, _ := strconv.ParseFloat(e.ExecPrice, 64)
+			qtyUsd, _ := strconv.ParseFloat(e.ExecQty, 64)
+			stopText := ""
+			if e.CreateType == "CreateByStopOrder" {
+				stopText = "Stop "
+			}
+			parts = append(parts, fmt.Sprintf("%s - %s %s %s%s | Preço: %s | USD: %s",
+				formatExecTimeToBrasilia(e.ExecTime), coin, e.Side, stopText, e.OrderType, formatPriceCoin(price), formatPriceCoin(qtyUsd)))
+		}
+		messageText := strings.Join(parts, "\n")
+		go wsm.sendExecutionNotification(wsConn, messageText)
+	}
+
+	if wsConn.Account.WebhookURLGoogleSheets != "" && wsConn.Account.SheetURLGoogleSheetsExecutions != "" {
+		byCoin := make(map[string][]ExecutionData)
+		for _, e := range executions {
+			coin := symbolToCoin(e.Symbol)
+			byCoin[coin] = append(byCoin[coin], e)
+		}
+		webhookURL := wsConn.Account.WebhookURLGoogleSheets
+		sheetURLExec := wsConn.Account.SheetURLGoogleSheetsExecutions
+		for coin, execs := range byCoin {
+			coinCopy := coin
+			execsCopy := make([]ExecutionData, len(execs))
+			copy(execsCopy, execs)
+			go func() {
+				if err := wsm.sendGoogleSheetsExecutionWebhook(webhookURL, sheetURLExec, coinCopy, execsCopy); err != nil && logger != nil {
+					logger.Log("Erro ao enviar webhook de execuções para %s: %v", coinCopy, err)
+				}
+			}()
+		}
+	}
+}
+
 func (wsm *WebSocketManager) flushExecutionNotificationBuffer(accountID int64) {
 	wsm.mu.RLock()
 	conn, exists := wsm.connections[accountID]
@@ -2125,51 +2744,7 @@ func (wsm *WebSocketManager) flushExecutionNotificationBuffer(accountID int64) {
 	buf.mu.Unlock()
 	wsm.bufferMu.Unlock()
 
-	if len(executions) == 0 {
-		return
-	}
-
-	logger, _ := getLogger(accountID, wsConn.Account.Name)
-
-	// Discord: uma mensagem com todas as execuções
-	if wsConn.Account.WebhookURLExecutions != "" {
-		var parts []string
-		for _, e := range executions {
-			coin := symbolToCoin(e.Symbol)
-			price, _ := strconv.ParseFloat(e.ExecPrice, 64)
-			qtyUsd, _ := strconv.ParseFloat(e.ExecQty, 64)    // valor em USD
-
-			stopText := ""
-			if e.CreateType == "CreateByStopOrder" {
-				stopText = "Stop "
-			}
-			parts = append(parts, fmt.Sprintf("%s - %s %s %s%s | Preço: %s | USD: %s",
-				formatExecTimeToBrasilia(e.ExecTime), coin, e.Side, stopText, e.OrderType, formatPriceCoin(price), formatPriceCoin(qtyUsd)))
-		}
-		messageText := strings.Join(parts, "\n")
-		go wsm.sendExecutionNotification(wsConn, messageText)
-	}
-
-	// Google Sheets: agrupar por moeda, uma requisição por moeda
-	if wsConn.Account.WebhookURLGoogleSheets != "" && wsConn.Account.SheetURLGoogleSheetsExecutions != "" {
-		byCoin := make(map[string][]ExecutionData)
-		for _, e := range executions {
-			coin := symbolToCoin(e.Symbol)
-			byCoin[coin] = append(byCoin[coin], e)
-		}
-		webhookURL := wsConn.Account.WebhookURLGoogleSheets
-		sheetURLExec := wsConn.Account.SheetURLGoogleSheetsExecutions
-		for coin, execs := range byCoin {
-			coinCopy := coin
-			execsCopy := make([]ExecutionData, len(execs))
-			copy(execsCopy, execs)
-			go func() {
-				if err := wsm.sendGoogleSheetsExecutionWebhook(webhookURL, sheetURLExec, coinCopy, execsCopy); err != nil && logger != nil {
-					logger.Log("Erro ao enviar webhook de execuções para %s: %v", coinCopy, err)
-				}
-			}()
-		}
-	}
+	wsm.flushExecutions(wsConn, executions)
 }
 
 func (wsm *WebSocketManager) sendExecutionNotification(wsConn *WebSocketConnection, messageText string) {

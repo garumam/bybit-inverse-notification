@@ -22,6 +22,7 @@ type BybitAccount struct {
 	SheetURLGoogleSheetsExecutions string
 	Platform                      string // "bybit" ou "okx"
 	Metadata                      string // JSON; OKX: {"passphrase":"..."}
+	NotificationDelaySeconds      int    // 0 = desligado; 3-20 = segundos para agrupar notificações
 }
 
 type AccountManager struct {
@@ -42,8 +43,8 @@ func (am *AccountManager) AddAccount(account *BybitAccount) error {
 		metadata = "{}"
 	}
 
-	query := `INSERT INTO bybit_accounts (name, api_key, api_secret, webhook_url, active, mark_everyone_order, mark_everyone_wallet, webhook_url_google_sheets, sheet_url_google_sheets, webhook_url_executions, mark_everyone_execution, sheet_url_google_sheets_executions, platform, metadata) 
-	          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	query := `INSERT INTO bybit_accounts (name, api_key, api_secret, webhook_url, active, mark_everyone_order, mark_everyone_wallet, webhook_url_google_sheets, sheet_url_google_sheets, webhook_url_executions, mark_everyone_execution, sheet_url_google_sheets_executions, platform, metadata, notification_delay_seconds) 
+	          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	
 	markEveryoneOrder := 0
 	if account.MarkEveryoneOrder {
@@ -62,11 +63,15 @@ func (am *AccountManager) AddAccount(account *BybitAccount) error {
 		active = 1
 	}
 	
+	delaySec := account.NotificationDelaySeconds
+	if delaySec < 0 || delaySec > 20 || (delaySec != 0 && delaySec < 3) {
+		delaySec = 0
+	}
 	_, err := am.db.GetDB().Exec(query, account.Name, account.APIKey, account.APISecret,
 		account.WebhookURL, active, markEveryoneOrder, markEveryoneWallet,
 		account.WebhookURLGoogleSheets, account.SheetURLGoogleSheets,
 		account.WebhookURLExecutions, markEveryoneExecution, account.SheetURLGoogleSheetsExecutions,
-		platform, metadata)
+		platform, metadata, delaySec)
 	return err
 }
 
@@ -82,7 +87,7 @@ func (am *AccountManager) RemoveAccount(id int64) error {
 }
 
 func (am *AccountManager) ListAccounts() ([]*BybitAccount, error) {
-	query := `SELECT id, name, api_key, api_secret, webhook_url, active, mark_everyone_order, mark_everyone_wallet, webhook_url_google_sheets, sheet_url_google_sheets, webhook_url_executions, mark_everyone_execution, sheet_url_google_sheets_executions, platform, metadata 
+	query := `SELECT id, name, api_key, api_secret, webhook_url, active, mark_everyone_order, mark_everyone_wallet, webhook_url_google_sheets, sheet_url_google_sheets, webhook_url_executions, mark_everyone_execution, sheet_url_google_sheets_executions, platform, metadata, notification_delay_seconds 
 	          FROM bybit_accounts ORDER BY id`
 	
 	rows, err := am.db.GetDB().Query(query)
@@ -99,7 +104,7 @@ func (am *AccountManager) ListAccounts() ([]*BybitAccount, error) {
 			&acc.WebhookURL, &active, &markEveryoneOrder, &markEveryoneWallet,
 			&acc.WebhookURLGoogleSheets, &acc.SheetURLGoogleSheets,
 			&acc.WebhookURLExecutions, &markEveryoneExecution, &acc.SheetURLGoogleSheetsExecutions,
-			&acc.Platform, &acc.Metadata)
+			&acc.Platform, &acc.Metadata, &acc.NotificationDelaySeconds)
 		if err != nil {
 			return nil, err
 		}
@@ -117,7 +122,7 @@ func (am *AccountManager) ListAccounts() ([]*BybitAccount, error) {
 }
 
 func (am *AccountManager) GetAccount(id int64) (*BybitAccount, error) {
-	query := `SELECT id, name, api_key, api_secret, webhook_url, active, mark_everyone_order, mark_everyone_wallet, webhook_url_google_sheets, sheet_url_google_sheets, webhook_url_executions, mark_everyone_execution, sheet_url_google_sheets_executions, platform, metadata 
+	query := `SELECT id, name, api_key, api_secret, webhook_url, active, mark_everyone_order, mark_everyone_wallet, webhook_url_google_sheets, sheet_url_google_sheets, webhook_url_executions, mark_everyone_execution, sheet_url_google_sheets_executions, platform, metadata, notification_delay_seconds 
 	          FROM bybit_accounts WHERE id = ?`
 	
 	acc := &BybitAccount{}
@@ -127,7 +132,7 @@ func (am *AccountManager) GetAccount(id int64) (*BybitAccount, error) {
 		&acc.WebhookURL, &active, &markEveryoneOrder, &markEveryoneWallet,
 		&acc.WebhookURLGoogleSheets, &acc.SheetURLGoogleSheets,
 		&acc.WebhookURLExecutions, &markEveryoneExecution, &acc.SheetURLGoogleSheetsExecutions,
-		&acc.Platform, &acc.Metadata)
+		&acc.Platform, &acc.Metadata, &acc.NotificationDelaySeconds)
 	
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -178,8 +183,8 @@ func (am *AccountManager) GetActiveConnections() ([]int64, error) {
 	return accountIDs, rows.Err()
 }
 
-// UpdateAccount atualiza a conta. platform não é alterado. apiKey e apiSecret são persistidos; metadata pode ser passado para atualizar (ex.: passphrase OKX); use "" para manter o atual.
-func (am *AccountManager) UpdateAccount(id int64, name, apiKey, apiSecret, webhookURL string, markEveryoneOrder, markEveryoneWallet bool, webhookURLGoogleSheets, sheetURLGoogleSheets, webhookURLExecutions, sheetURLGoogleSheetsExecutions string, markEveryoneExecution bool, metadata string) error {
+// UpdateAccount atualiza a conta. platform não é alterado. apiKey e apiSecret são persistidos; metadata pode ser passado para atualizar (ex.: passphrase OKX); use "" para manter o atual. notificationDelaySeconds: 0 ou 3-20.
+func (am *AccountManager) UpdateAccount(id int64, name, apiKey, apiSecret, webhookURL string, markEveryoneOrder, markEveryoneWallet bool, webhookURLGoogleSheets, sheetURLGoogleSheets, webhookURLExecutions, sheetURLGoogleSheetsExecutions string, markEveryoneExecution bool, metadata string, notificationDelaySeconds int) error {
 	markEveryoneOrderInt := 0
 	if markEveryoneOrder {
 		markEveryoneOrderInt = 1
@@ -192,15 +197,19 @@ func (am *AccountManager) UpdateAccount(id int64, name, apiKey, apiSecret, webho
 	if markEveryoneExecution {
 		markEveryoneExecutionInt = 1
 	}
+	delaySec := notificationDelaySeconds
+	if delaySec < 0 || delaySec > 20 || (delaySec != 0 && delaySec < 3) {
+		delaySec = 0
+	}
 
 	// Se metadata foi passado (não é o sentinel "keep"), atualizar; senão fazer UPDATE sem metadata
 	if metadata != "" {
-		query := `UPDATE bybit_accounts SET name = ?, api_key = ?, api_secret = ?, webhook_url = ?, mark_everyone_order = ?, mark_everyone_wallet = ?, webhook_url_google_sheets = ?, sheet_url_google_sheets = ?, webhook_url_executions = ?, mark_everyone_execution = ?, sheet_url_google_sheets_executions = ?, metadata = ? WHERE id = ?`
-		_, err := am.db.GetDB().Exec(query, name, apiKey, apiSecret, webhookURL, markEveryoneOrderInt, markEveryoneWalletInt, webhookURLGoogleSheets, sheetURLGoogleSheets, webhookURLExecutions, markEveryoneExecutionInt, sheetURLGoogleSheetsExecutions, metadata, id)
+		query := `UPDATE bybit_accounts SET name = ?, api_key = ?, api_secret = ?, webhook_url = ?, mark_everyone_order = ?, mark_everyone_wallet = ?, webhook_url_google_sheets = ?, sheet_url_google_sheets = ?, webhook_url_executions = ?, mark_everyone_execution = ?, sheet_url_google_sheets_executions = ?, metadata = ?, notification_delay_seconds = ? WHERE id = ?`
+		_, err := am.db.GetDB().Exec(query, name, apiKey, apiSecret, webhookURL, markEveryoneOrderInt, markEveryoneWalletInt, webhookURLGoogleSheets, sheetURLGoogleSheets, webhookURLExecutions, markEveryoneExecutionInt, sheetURLGoogleSheetsExecutions, metadata, delaySec, id)
 		return err
 	}
-	query := `UPDATE bybit_accounts SET name = ?, api_key = ?, api_secret = ?, webhook_url = ?, mark_everyone_order = ?, mark_everyone_wallet = ?, webhook_url_google_sheets = ?, sheet_url_google_sheets = ?, webhook_url_executions = ?, mark_everyone_execution = ?, sheet_url_google_sheets_executions = ? WHERE id = ?`
-	_, err := am.db.GetDB().Exec(query, name, apiKey, apiSecret, webhookURL, markEveryoneOrderInt, markEveryoneWalletInt, webhookURLGoogleSheets, sheetURLGoogleSheets, webhookURLExecutions, markEveryoneExecutionInt, sheetURLGoogleSheetsExecutions, id)
+	query := `UPDATE bybit_accounts SET name = ?, api_key = ?, api_secret = ?, webhook_url = ?, mark_everyone_order = ?, mark_everyone_wallet = ?, webhook_url_google_sheets = ?, sheet_url_google_sheets = ?, webhook_url_executions = ?, mark_everyone_execution = ?, sheet_url_google_sheets_executions = ?, notification_delay_seconds = ? WHERE id = ?`
+	_, err := am.db.GetDB().Exec(query, name, apiKey, apiSecret, webhookURL, markEveryoneOrderInt, markEveryoneWalletInt, webhookURLGoogleSheets, sheetURLGoogleSheets, webhookURLExecutions, markEveryoneExecutionInt, sheetURLGoogleSheetsExecutions, delaySec, id)
 	return err
 }
 
