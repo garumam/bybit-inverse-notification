@@ -756,9 +756,9 @@ func (wsm *WebSocketManager) handleOrderMessage(wsConn *WebSocketConnection, ord
 			wsm.addStopToDelayBuffer(wsConn.AccountID, orderData, wsConn)
 			continue
 		}
-		if orderData.CreateType == "CreateByStopOrder" {
+		if orderData.CreateType == "CreateByStopOrder" || orderData.CreateType == "CreateByPartialStopLoss" || orderData.OrderStatus == "Triggered" {
 			if logger != nil {
-				logger.Log("[DEBUG] Ordem ignorada - CreateByStopOrder (status: %s)", orderData.OrderStatus)
+				logger.Log("[DEBUG] Ordem ignorada - CreateByStopOrder | CreateByPartialStopLoss | Triggered (status: %s)", orderData.OrderStatus)
 			}
 			continue
 		}
