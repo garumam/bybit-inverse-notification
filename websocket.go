@@ -897,8 +897,9 @@ func formatStopOrderMessage(order OrderData, wallet *WalletData) string {
 	} else {
 		stopIcon = "🔴"
 	}
-	return fmt.Sprintf("%s Stop %s%s %s - %s @ %s %s%s",
-		stopIcon, reducePrefix, order.Side, order.OrderType, order.Symbol, formatPriceCoin(triggerPrice), mensagemQty, pctSuffix)
+	stopTypeSuffix := formatStopOrderTypeSuffix(order.StopOrderType)
+	return fmt.Sprintf("%s Stop %s%s %s - %s @ %s %s%s%s",
+		stopIcon, reducePrefix, order.Side, order.OrderType, order.Symbol, formatPriceCoin(triggerPrice), mensagemQty, pctSuffix, stopTypeSuffix)
 }
 
 // formatStopMovedMessage formata mensagem de stop movido (trigger price alterado). Usado por processDelayBuffer.
@@ -920,8 +921,9 @@ func formatStopMovedMessage(order OrderData, oldPrice, newPrice float64, wallet 
 	} else {
 		stopIcon = "🔴"
 	}
-	return fmt.Sprintf("📝 %s Stop movido - %s %s%s %s\n   Preço: %s → %s %s%s",
-		stopIcon, order.Symbol, reducePrefix, order.Side, order.OrderType, formatPriceCoin(oldPrice), formatPriceCoin(newPrice), mensagemQty, pctSuffix)
+	stopTypeSuffix := formatStopOrderTypeSuffix(order.StopOrderType)
+	return fmt.Sprintf("📝 %s Stop movido - %s %s%s %s%s\n   Preço: %s → %s %s%s",
+		stopIcon, order.Symbol, reducePrefix, order.Side, order.OrderType, stopTypeSuffix, formatPriceCoin(oldPrice), formatPriceCoin(newPrice), mensagemQty, pctSuffix)
 }
 
 // formatStopCancellationMessage formata mensagem de stop cancelado (Deactivated).
@@ -953,8 +955,19 @@ func formatStopCancellationMessage(order OrderData) string {
 	} else {
 		stopIcon = "🔴"
 	}
-	return fmt.Sprintf("❌ %s Stop %s%s %s **CANCELADO** - %s @ %s %s",
-		stopIcon, reducePrefix, order.Side, order.OrderType, order.Symbol, formatPriceCoin(triggerPrice), mensagemQty)
+	stopTypeSuffix := formatStopOrderTypeSuffix(order.StopOrderType)
+	return fmt.Sprintf("❌ %s Stop %s%s %s **CANCELADO** - %s @ %s %s%s",
+		stopIcon, reducePrefix, order.Side, order.OrderType, order.Symbol, formatPriceCoin(triggerPrice), mensagemQty, stopTypeSuffix)
+}
+
+// formatStopOrderTypeSuffix retorna o sufixo de tipo de stop para mensagem.
+// Não exibe quando vazio ou quando for o tipo genérico "Stop".
+func formatStopOrderTypeSuffix(stopOrderType string) string {
+	value := strings.TrimSpace(stopOrderType)
+	if value == "" || strings.EqualFold(value, "Stop") {
+		return ""
+	}
+	return fmt.Sprintf(" (Tipo: %s)", value)
 }
 
 // sortOrderVersionsByUpdatedTime ordena in-place por updatedTime (ms) crescente.
@@ -1261,8 +1274,13 @@ func (wsm *WebSocketManager) processDelayBuffer(accountID int64, wsConn *WebSock
 			}
 		}
 
-		// Várias versões todas Untriggered: verificar se trigger price mudou (stop movido)
-		if oldest.OrderStatus == "Untriggered" && newest.OrderStatus == "Untriggered" && hasExistingStopOrder && existingStopOrder.TriggerPrice != newest.TriggerPrice {
+		// Várias versões todas Untriggered:
+		// - se já existe no banco e trigger não mudou, ignora atualização redundante
+		// - se trigger mudou, trata como stop movido
+		if oldest.OrderStatus == "Untriggered" && newest.OrderStatus == "Untriggered" && hasExistingStopOrder {
+			if existingStopOrder.TriggerPrice == newest.TriggerPrice {
+				continue
+			}
 			if o, errO := strconv.ParseFloat(existingStopOrder.TriggerPrice, 64); errO == nil {
 				if n, errN := strconv.ParseFloat(newest.TriggerPrice, 64); errN == nil {
 					stopMovedPrices[newest.OrderID] = struct{ Old, New float64 }{o, n}
@@ -1555,6 +1573,11 @@ func (wsm *WebSocketManager) handlePositionMessage(wsConn *WebSocketConnection, 
 		logger.Log("[DEBUG] Mensagem de position recebida! Total de posições: %d", len(posMsg.Data))
 	}
 
+	oneWayMode, err := wsm.accountManager.GetOneWayMode(wsConn.AccountID)
+	if err != nil {
+		oneWayMode = true
+	}
+
 	// Processar apenas posições inverse
 	for _, posData := range posMsg.Data {
 		if posData.Category != "inverse" {
@@ -1565,8 +1588,12 @@ func (wsm *WebSocketManager) handlePositionMessage(wsConn *WebSocketConnection, 
 		}
 
 		// Persistir última mensagem de position no banco (logo após validar)
+		messageType := "position"
+		if !oneWayMode && (posData.Side == "Buy" || posData.Side == "Sell") {
+			messageType = "position" + posData.Side
+		}
 		if jsonData, err := json.Marshal(posData); err == nil {
-			if err := wsm.db.SaveLastMessageSnapshot(wsConn.AccountID, "position", posData.Symbol, string(jsonData)); err != nil && logger != nil {
+			if err := wsm.db.SaveLastMessageSnapshot(wsConn.AccountID, messageType, posData.Symbol, string(jsonData)); err != nil && logger != nil {
 				logger.Log("Erro ao salvar snapshot de position no banco: %v", err)
 			}
 		}
@@ -1710,6 +1737,61 @@ func mergeWalletSnapshotRows(rows []WalletSnapshotRow) *WalletData {
 	return &base
 }
 
+func (wsm *WebSocketManager) getPositionSnapshotTypes(accountID int64) []string {
+	oneWayMode, err := wsm.accountManager.GetOneWayMode(accountID)
+	if err != nil || oneWayMode {
+		return []string{"position"}
+	}
+	return []string{"positionBuy", "positionSell"}
+}
+
+func buildPositionsBySymbol(positionRows []PositionSnapshotRow) map[string][]*PositionData {
+	positions := make(map[string][]*PositionData)
+	for _, row := range positionRows {
+		var pos PositionData
+		if err := json.Unmarshal([]byte(row.Message), &pos); err == nil {
+			positions[row.Symbol] = append(positions[row.Symbol], &pos)
+		}
+	}
+	return positions
+}
+
+func calculatePositionValuesByMode(positions []*PositionData, totalEquityCoin float64, oneWayMode bool) (longUSD, protecaoUSD, expostoUSD float64) {
+	if len(positions) == 0 {
+		return 0, 0, totalEquityCoin
+	}
+
+	if oneWayMode {
+		size, err := strconv.ParseFloat(positions[0].Size, 64)
+		if err != nil {
+			size = 0
+		}
+		if positions[0].Side == "Sell" {
+			protecaoUSD = size
+			longUSD = 0
+		} else {
+			protecaoUSD = 0
+			longUSD = size
+		}
+		expostoUSD = totalEquityCoin - size
+		return
+	}
+
+	for _, position := range positions {
+		size, err := strconv.ParseFloat(position.Size, 64)
+		if err != nil {
+			size = 0
+		}
+		if position.Side == "Sell" {
+			protecaoUSD += size
+		} else if position.Side == "Buy" {
+			longUSD += size
+		}
+	}
+	expostoUSD = totalEquityCoin - protecaoUSD - longUSD
+	return
+}
+
 func (wsm *WebSocketManager) processWalletNotification(accountID int64, wsConn *WebSocketConnection) {
 	// Capturar panics
 	defer func() {
@@ -1753,18 +1835,13 @@ func (wsm *WebSocketManager) processWalletNotification(accountID int64, wsConn *
 		return
 	}
 
-	// Buscar posições no banco (referentes às coins da wallet)
-	positionRows, err := wsm.db.GetPositionSnapshots(accountID)
+	positionTypes := wsm.getPositionSnapshotTypes(accountID)
+	oneWayMode := len(positionTypes) == 1 && positionTypes[0] == "position"
+	positionRows, err := wsm.db.GetPositionSnapshotsByTypes(accountID, positionTypes)
 	if err != nil {
 		return
 	}
-	positions := make(map[string]*PositionData)
-	for _, row := range positionRows {
-		var pos PositionData
-		if err := json.Unmarshal([]byte(row.Message), &pos); err == nil {
-			positions[row.Symbol] = &pos
-		}
-	}
+	positionsBySymbol := buildPositionsBySymbol(positionRows)
 
 	// Obter valor total da carteira do wallet
 	totalEquity, err := strconv.ParseFloat(lastWallet.TotalEquity, 64)
@@ -1777,27 +1854,6 @@ func (wsm *WebSocketManager) processWalletNotification(accountID int64, wsConn *
 		}
 	}
 
-	// Função auxiliar para calcular proteção de uma posição
-	calculatePositionValues := func(position *PositionData, totalEquityCoin float64) (longUSD, protecaoUSD, expostoUSD float64) {
-		// Converter position.Size de string para float64
-		size, err := strconv.ParseFloat(position.Size, 64)
-		if err != nil {
-			size = 0
-		}
-
-		if position.Side == "Sell" {
-			protecaoUSD = size
-			longUSD = 0
-		} else {
-			protecaoUSD = 0
-			longUSD = size
-		}
-
-		// Exposto = total da moeda - protegido
-		expostoUSD = totalEquityCoin - size
-		return
-	}
-
 	// Calcular valores por moeda e preparar mensagens
 	var totalProtecaoUSD float64
 	var totalLongUSD float64
@@ -1806,7 +1862,7 @@ func (wsm *WebSocketManager) processWalletNotification(accountID int64, wsConn *
 	var totalValidPositions int = 0
 
 	// Processar todas as posições para calcular totais e criar mensagens
-	for symbol, position := range positions {
+	for symbol, symbolPositions := range positionsBySymbol {
 		// Extrair moeda do símbolo (ex: BTCUSD -> BTC, ETHUSD -> ETH)
 		coin := symbol
 		if strings.HasSuffix(symbol, "USD") {
@@ -1836,7 +1892,7 @@ func (wsm *WebSocketManager) processWalletNotification(accountID int64, wsConn *
 		totalValidPositions++
 
 		// Calcular valores da posição
-		longPosUSD, protecaoPosUSD, expostoPosUSD := calculatePositionValues(position, totalEquityPerCoin)
+		longPosUSD, protecaoPosUSD, expostoPosUSD := calculatePositionValuesByMode(symbolPositions, totalEquityPerCoin, oneWayMode)
 		totalProtecaoUSD += protecaoPosUSD
 		totalLongUSD += longPosUSD
 		totalExposicaoUSD += expostoPosUSD
@@ -1945,33 +2001,13 @@ func (wsm *WebSocketManager) processSheetsNotification(accountID int64) {
 		return
 	}
 
-	positionRows, err := wsm.db.GetPositionSnapshots(accountID)
+	positionTypes := wsm.getPositionSnapshotTypes(accountID)
+	oneWayMode := len(positionTypes) == 1 && positionTypes[0] == "position"
+	positionRows, err := wsm.db.GetPositionSnapshotsByTypes(accountID, positionTypes)
 	if err != nil {
 		return
 	}
-	positions := make(map[string]*PositionData)
-	for _, row := range positionRows {
-		var pos PositionData
-		if err := json.Unmarshal([]byte(row.Message), &pos); err == nil {
-			positions[row.Symbol] = &pos
-		}
-	}
-
-	calculatePositionValues := func(position *PositionData, totalEquityCoin float64) (longUSD, protecaoUSD, expostoUSD float64) {
-		size, err := strconv.ParseFloat(position.Size, 64)
-		if err != nil {
-			size = 0
-		}
-		if position.Side == "Sell" {
-			protecaoUSD = size
-			longUSD = 0
-		} else {
-			protecaoUSD = 0
-			longUSD = size
-		}
-		expostoUSD = totalEquityCoin - size
-		return
-	}
+	positionsBySymbol := buildPositionsBySymbol(positionRows)
 
 	logger, _ := getLogger(accountID, wsConn.Account.Name)
 	now := getBrasiliaTime()
@@ -1986,8 +2022,8 @@ func (wsm *WebSocketManager) processSheetsNotification(accountID int64) {
 
 	for _, coinBalance := range lastWallet.Coin {
 		coin := coinBalance.Coin
-		var position *PositionData
-		for posSymbol, pos := range positions {
+		var coinPositions []*PositionData
+		for posSymbol, posList := range positionsBySymbol {
 			posCoin := posSymbol
 			if strings.HasSuffix(posSymbol, "USD") {
 				posCoin = posSymbol[:len(posSymbol)-3]
@@ -1997,19 +2033,13 @@ func (wsm *WebSocketManager) processSheetsNotification(accountID int64) {
 				posCoin = posSymbol[:len(posSymbol)-4]
 			}
 			if posCoin == coin {
-				position = pos
-				break
+				coinPositions = append(coinPositions, posList...)
 			}
 		}
 
 		equity, _ := strconv.ParseFloat(coinBalance.Equity, 64)
 		usdValue, _ := strconv.ParseFloat(coinBalance.UsdValue, 64)
-		var protecaoUSD, expostoUSD, longUSD float64
-		if position != nil {
-			longUSD, protecaoUSD, expostoUSD = calculatePositionValues(position, usdValue)
-		} else {
-			expostoUSD = usdValue
-		}
+		longUSD, protecaoUSD, expostoUSD := calculatePositionValuesByMode(coinPositions, usdValue, oneWayMode)
 
 		columns := []interface{}{
 			dateTimeStr,

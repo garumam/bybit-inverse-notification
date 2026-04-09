@@ -15,6 +15,7 @@ type BybitAccount struct {
 	Active                        bool
 	MarkEveryoneOrder             bool
 	MarkEveryoneWallet            bool
+	OneWayMode                    bool
 	WebhookURLGoogleSheets        string
 	SheetURLGoogleSheets          string
 	WebhookURLExecutions          string
@@ -43,8 +44,8 @@ func (am *AccountManager) AddAccount(account *BybitAccount) error {
 		metadata = "{}"
 	}
 
-	query := `INSERT INTO bybit_accounts (name, api_key, api_secret, webhook_url, active, mark_everyone_order, mark_everyone_wallet, webhook_url_google_sheets, sheet_url_google_sheets, webhook_url_executions, mark_everyone_execution, sheet_url_google_sheets_executions, platform, metadata, notification_delay_seconds) 
-	          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	query := `INSERT INTO bybit_accounts (name, api_key, api_secret, webhook_url, active, mark_everyone_order, mark_everyone_wallet, one_way_mode, webhook_url_google_sheets, sheet_url_google_sheets, webhook_url_executions, mark_everyone_execution, sheet_url_google_sheets_executions, platform, metadata, notification_delay_seconds) 
+	          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	
 	markEveryoneOrder := 0
 	if account.MarkEveryoneOrder {
@@ -62,13 +63,14 @@ func (am *AccountManager) AddAccount(account *BybitAccount) error {
 	if account.Active {
 		active = 1
 	}
+	oneWayMode := 1
 	
 	delaySec := account.NotificationDelaySeconds
 	if delaySec < 0 || delaySec > 20 || (delaySec != 0 && delaySec < 3) {
 		delaySec = 0
 	}
 	_, err := am.db.GetDB().Exec(query, account.Name, account.APIKey, account.APISecret,
-		account.WebhookURL, active, markEveryoneOrder, markEveryoneWallet,
+		account.WebhookURL, active, markEveryoneOrder, markEveryoneWallet, oneWayMode,
 		account.WebhookURLGoogleSheets, account.SheetURLGoogleSheets,
 		account.WebhookURLExecutions, markEveryoneExecution, account.SheetURLGoogleSheetsExecutions,
 		platform, metadata, delaySec)
@@ -87,7 +89,7 @@ func (am *AccountManager) RemoveAccount(id int64) error {
 }
 
 func (am *AccountManager) ListAccounts() ([]*BybitAccount, error) {
-	query := `SELECT id, name, api_key, api_secret, webhook_url, active, mark_everyone_order, mark_everyone_wallet, webhook_url_google_sheets, sheet_url_google_sheets, webhook_url_executions, mark_everyone_execution, sheet_url_google_sheets_executions, platform, metadata, notification_delay_seconds 
+	query := `SELECT id, name, api_key, api_secret, webhook_url, active, mark_everyone_order, mark_everyone_wallet, one_way_mode, webhook_url_google_sheets, sheet_url_google_sheets, webhook_url_executions, mark_everyone_execution, sheet_url_google_sheets_executions, platform, metadata, notification_delay_seconds 
 	          FROM bybit_accounts ORDER BY id`
 	
 	rows, err := am.db.GetDB().Query(query)
@@ -99,9 +101,9 @@ func (am *AccountManager) ListAccounts() ([]*BybitAccount, error) {
 	var accounts []*BybitAccount
 	for rows.Next() {
 		acc := &BybitAccount{}
-		var active, markEveryoneOrder, markEveryoneWallet, markEveryoneExecution int
+		var active, markEveryoneOrder, markEveryoneWallet, markEveryoneExecution, oneWayMode int
 		err := rows.Scan(&acc.ID, &acc.Name, &acc.APIKey, &acc.APISecret,
-			&acc.WebhookURL, &active, &markEveryoneOrder, &markEveryoneWallet,
+			&acc.WebhookURL, &active, &markEveryoneOrder, &markEveryoneWallet, &oneWayMode,
 			&acc.WebhookURLGoogleSheets, &acc.SheetURLGoogleSheets,
 			&acc.WebhookURLExecutions, &markEveryoneExecution, &acc.SheetURLGoogleSheetsExecutions,
 			&acc.Platform, &acc.Metadata, &acc.NotificationDelaySeconds)
@@ -111,6 +113,7 @@ func (am *AccountManager) ListAccounts() ([]*BybitAccount, error) {
 		acc.Active = active == 1
 		acc.MarkEveryoneOrder = markEveryoneOrder == 1
 		acc.MarkEveryoneWallet = markEveryoneWallet == 1
+		acc.OneWayMode = oneWayMode == 1
 		acc.MarkEveryoneExecution = markEveryoneExecution == 1
 		if acc.Platform == "" {
 			acc.Platform = "bybit"
@@ -122,14 +125,14 @@ func (am *AccountManager) ListAccounts() ([]*BybitAccount, error) {
 }
 
 func (am *AccountManager) GetAccount(id int64) (*BybitAccount, error) {
-	query := `SELECT id, name, api_key, api_secret, webhook_url, active, mark_everyone_order, mark_everyone_wallet, webhook_url_google_sheets, sheet_url_google_sheets, webhook_url_executions, mark_everyone_execution, sheet_url_google_sheets_executions, platform, metadata, notification_delay_seconds 
+	query := `SELECT id, name, api_key, api_secret, webhook_url, active, mark_everyone_order, mark_everyone_wallet, one_way_mode, webhook_url_google_sheets, sheet_url_google_sheets, webhook_url_executions, mark_everyone_execution, sheet_url_google_sheets_executions, platform, metadata, notification_delay_seconds 
 	          FROM bybit_accounts WHERE id = ?`
 	
 	acc := &BybitAccount{}
-	var active, markEveryoneOrder, markEveryoneWallet, markEveryoneExecution int
+	var active, markEveryoneOrder, markEveryoneWallet, markEveryoneExecution, oneWayMode int
 	err := am.db.GetDB().QueryRow(query, id).Scan(
 		&acc.ID, &acc.Name, &acc.APIKey, &acc.APISecret,
-		&acc.WebhookURL, &active, &markEveryoneOrder, &markEveryoneWallet,
+		&acc.WebhookURL, &active, &markEveryoneOrder, &markEveryoneWallet, &oneWayMode,
 		&acc.WebhookURLGoogleSheets, &acc.SheetURLGoogleSheets,
 		&acc.WebhookURLExecutions, &markEveryoneExecution, &acc.SheetURLGoogleSheetsExecutions,
 		&acc.Platform, &acc.Metadata, &acc.NotificationDelaySeconds)
@@ -144,6 +147,7 @@ func (am *AccountManager) GetAccount(id int64) (*BybitAccount, error) {
 	acc.Active = active == 1
 	acc.MarkEveryoneOrder = markEveryoneOrder == 1
 	acc.MarkEveryoneWallet = markEveryoneWallet == 1
+	acc.OneWayMode = oneWayMode == 1
 	acc.MarkEveryoneExecution = markEveryoneExecution == 1
 	if acc.Platform == "" {
 		acc.Platform = "bybit"
@@ -234,5 +238,22 @@ func (am *AccountManager) DeleteOrder(orderID string) error {
 	query := `DELETE FROM orders WHERE order_id = ?`
 	_, err := am.db.GetDB().Exec(query, orderID)
 	return err
+}
+
+func (am *AccountManager) UpdateOneWayMode(accountID int64, oneWayMode bool) error {
+	value := 1
+	if !oneWayMode {
+		value = 0
+	}
+	_, err := am.db.GetDB().Exec(`UPDATE bybit_accounts SET one_way_mode = ? WHERE id = ?`, value, accountID)
+	return err
+}
+
+func (am *AccountManager) GetOneWayMode(accountID int64) (bool, error) {
+	var oneWayMode int
+	if err := am.db.GetDB().QueryRow(`SELECT one_way_mode FROM bybit_accounts WHERE id = ?`, accountID).Scan(&oneWayMode); err != nil {
+		return true, err
+	}
+	return oneWayMode == 1, nil
 }
 

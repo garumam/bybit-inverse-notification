@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -54,6 +55,7 @@ func (d *Database) initSchema() error {
 		sheet_url_google_sheets TEXT NOT NULL DEFAULT '',
 		mark_everyone_order INTEGER DEFAULT 0,
 		mark_everyone_wallet INTEGER DEFAULT 0,
+		one_way_mode INTEGER DEFAULT 1,
 		active INTEGER DEFAULT 1,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);`
@@ -111,6 +113,9 @@ func (d *Database) initSchema() error {
 	}
 
 	if err := d.addColumnIfNotExists("bybit_accounts", "mark_everyone_wallet", "INTEGER DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := d.addColumnIfNotExists("bybit_accounts", "one_way_mode", "INTEGER DEFAULT 1"); err != nil {
 		return err
 	}
 
@@ -195,9 +200,27 @@ type PositionSnapshotRow struct {
 
 // GetPositionSnapshots retorna os snapshots de position da conta (uma linha por símbolo, a mais recente).
 func (d *Database) GetPositionSnapshots(accountID int64) ([]PositionSnapshotRow, error) {
+	return d.GetPositionSnapshotsByTypes(accountID, []string{"position"})
+}
+
+// GetPositionSnapshotsByTypes retorna snapshots de position filtrando por tipos de mensagem.
+func (d *Database) GetPositionSnapshotsByTypes(accountID int64, messageTypes []string) ([]PositionSnapshotRow, error) {
+	if len(messageTypes) == 0 {
+		return []PositionSnapshotRow{}, nil
+	}
+
+	placeholders := make([]string, len(messageTypes))
+	args := make([]interface{}, 0, len(messageTypes)+1)
+	args = append(args, accountID)
+	for i, messageType := range messageTypes {
+		placeholders[i] = "?"
+		args = append(args, messageType)
+	}
+
+	query := `SELECT symbol, message FROM last_message_snapshots WHERE account_id = ? AND message_type IN (` + strings.Join(placeholders, ",") + `)`
 	rows, err := d.db.Query(
-		`SELECT symbol, message FROM last_message_snapshots WHERE account_id = ? AND message_type = 'position'`,
-		accountID,
+		query,
+		args...,
 	)
 	if err != nil {
 		return nil, err

@@ -540,10 +540,29 @@ func okxAlgoOrderToBybit(obj map[string]interface{}) (OrderData, bool) {
 		UpdatedTime:   uTime,
 		ReduceOnly:    reduceOnly == "true",
 		RejectReason:  "EC_NoError",
-		StopOrderType: "Stop",
+		StopOrderType: okxNormalizeStopOrderType(tpTriggerPx, slTriggerPx),
 		TriggerPrice:  triggerPrice,
 	}
 	return orderData, true
+}
+
+func okxNormalizeStopOrderType(tpTriggerPx, slTriggerPx string) string {
+	if okxIsPositivePx(tpTriggerPx) {
+		return "TakeProfit"
+	}
+	if okxIsPositivePx(slTriggerPx) {
+		return "StopLoss"
+	}
+	return "Stop"
+}
+
+func okxIsPositivePx(px string) bool {
+	value := strings.TrimSpace(px)
+	if value == "" {
+		return false
+	}
+	parsed, err := strconv.ParseFloat(value, 64)
+	return err == nil && parsed > 0
 }
 
 func okxInstIdToSymbol(instId string) string {
@@ -661,6 +680,7 @@ func (wsm *WebSocketManager) processOKXAccount(wsConn *WebSocketConnection, data
 
 func (wsm *WebSocketManager) processOKXPositions(wsConn *WebSocketConnection, dataSlice []interface{}) {
 	var positions []PositionData
+	oneWayMode := true
 	for _, d := range dataSlice {
 		obj, ok := d.(map[string]interface{})
 		if !ok {
@@ -676,6 +696,9 @@ func (wsm *WebSocketManager) processOKXPositions(wsConn *WebSocketConnection, da
 			continue
 		}
 		posSide, _ := obj["posSide"].(string)
+		if posSide == "long" || posSide == "short" {
+			oneWayMode = false
+		}
 		side := okxPositionSideToBybit(posSide, pos)
 		avgPx, _ := obj["avgPx"].(string)
 		markPx, _ := obj["markPx"].(string)
@@ -691,6 +714,10 @@ func (wsm *WebSocketManager) processOKXPositions(wsConn *WebSocketConnection, da
 		})
 	}
 	if len(positions) > 0 {
+		_ = wsm.accountManager.UpdateOneWayMode(wsConn.AccountID, oneWayMode)
+		if wsConn.Account != nil {
+			wsConn.Account.OneWayMode = oneWayMode
+		}
 		msg := BybitPositionMessage{Data: positions}
 		wsm.handlePositionMessage(wsConn, msg)
 	}
@@ -731,7 +758,7 @@ func okxOrderToBybit(obj map[string]interface{}, symbol string) (orderData Order
 		case "live":
 			// Stop ainda não executado → Bybit "Untriggered"
 			orderStatus = "Untriggered"
-			stopOrderType = "Stop"
+			stopOrderType = okxNormalizeStopOrderType(tpTriggerPx, slTriggerPx)
 			if slTriggerPx != "" {
 				triggerPrice = slTriggerPx
 			} else if tpTriggerPx != "" {
@@ -742,7 +769,7 @@ func okxOrderToBybit(obj map[string]interface{}, symbol string) (orderData Order
 		case "canceled", "mmp_canceled":
 			// Stop cancelado → Bybit "Deactivated"
 			orderStatus = "Deactivated"
-			stopOrderType = "Stop"
+			stopOrderType = okxNormalizeStopOrderType(tpTriggerPx, slTriggerPx)
 			if slTriggerPx != "" {
 				triggerPrice = slTriggerPx
 			} else if tpTriggerPx != "" {

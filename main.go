@@ -9,6 +9,8 @@ import (
 	"strings"
 )
 
+const projectVersion = "v0.0.5"
+
 func main() {
 	db, err := NewDatabase()
 	if err != nil {
@@ -88,7 +90,7 @@ func getMonitoredAccountsCount(wsManager *WebSocketManager) int {
 func showMenu(wsManager *WebSocketManager) {
 	monitoredCount := getMonitoredAccountsCount(wsManager)
 	
-	fmt.Println("\n=== Gerenciador de Contas Bybit ===")
+	fmt.Printf("\n=== Gerenciador de Contas Bybit (%s) ===\n", projectVersion)
 	fmt.Printf("📊 Contas sendo monitoradas: %d\n", monitoredCount)
 	fmt.Println("═══════════════════════════════════════════════════════════")
 	fmt.Println("1. Cadastrar conta")
