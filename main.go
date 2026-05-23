@@ -9,7 +9,7 @@ import (
 	"strings"
 )
 
-const projectVersion = "v0.0.5"
+const projectVersion = "v0.0.6"
 
 func main() {
 	db, err := NewDatabase()
@@ -54,6 +54,8 @@ func main() {
 		case "8":
 			handleViewLogs(wsManager.accountManager, scanner)
 		case "9":
+			handleManageSnapshots(wsManager.accountManager, db, scanner)
+		case "10":
 			fmt.Println("Saindo...")
 			return
 		default:
@@ -101,7 +103,8 @@ func showMenu(wsManager *WebSocketManager) {
 	fmt.Println("6. Parar monitoramento da conta")
 	fmt.Println("7. Ver contas monitoradas")
 	fmt.Println("8. Visualizar logs")
-	fmt.Println("9. Desligar")
+	fmt.Println("9. Gerenciar snapshots do banco")
+	fmt.Println("10. Desligar")
 	fmt.Println("═══════════════════════════════════════════════════════════")
 	fmt.Println("ℹ️  Se a janela for fechada, o monitoramento será pausado")
 	fmt.Println("   automaticamente.")
@@ -1225,5 +1228,117 @@ func viewLogTail(accountID int64, accountName string, scanner *bufio.Scanner) {
 			fmt.Println(line)
 		}
 	}
+}
+
+func handleManageSnapshots(manager *AccountManager, db *Database, scanner *bufio.Scanner) {
+	clearScreen()
+	accounts, err := manager.ListAccounts()
+	if err != nil {
+		fmt.Printf("Erro ao listar contas: %v\n", err)
+		fmt.Println("\nPressione Enter para voltar ao menu principal...")
+		scanner.Scan()
+		return
+	}
+	if len(accounts) == 0 {
+		fmt.Println("=== Gerenciar Snapshots do Banco ===")
+		fmt.Println("\nNenhuma conta cadastrada.")
+		fmt.Println("\nPressione Enter para voltar ao menu principal...")
+		scanner.Scan()
+		return
+	}
+
+	fmt.Println("=== Gerenciar Snapshots do Banco ===")
+	fmt.Println("\n=== Contas Cadastradas ===")
+	for i, acc := range accounts {
+		platformLabel := acc.Platform
+		if platformLabel == "" {
+			platformLabel = "bybit"
+		}
+		fmt.Printf("%d. %s (ID: %d, %s)\n", i+1, acc.Name, acc.ID, platformLabel)
+	}
+	fmt.Println("0. Voltar ao menu principal")
+
+	fmt.Print("\nDigite o número da conta (ou 0 para voltar): ")
+	scanner.Scan()
+	var accountIndex int
+	if _, err := fmt.Sscanf(strings.TrimSpace(scanner.Text()), "%d", &accountIndex); err != nil {
+		fmt.Println("Número inválido!")
+		fmt.Println("\nPressione Enter para voltar ao menu principal...")
+		scanner.Scan()
+		return
+	}
+	if accountIndex == 0 {
+		return
+	}
+	if accountIndex < 1 || accountIndex > len(accounts) {
+		fmt.Println("Número inválido!")
+		fmt.Println("\nPressione Enter para voltar ao menu principal...")
+		scanner.Scan()
+		return
+	}
+
+	account := accounts[accountIndex-1]
+	accountID := account.ID
+
+	rows, err := db.ListLastMessageSnapshots(accountID)
+	if err != nil {
+		fmt.Printf("Erro ao listar snapshots: %v\n", err)
+		fmt.Println("\nPressione Enter para voltar ao menu principal...")
+		scanner.Scan()
+		return
+	}
+	if len(rows) == 0 {
+		fmt.Printf("\nNenhum snapshot encontrado para a conta '%s' (ID: %d).\n", account.Name, accountID)
+		fmt.Println("\nPressione Enter para voltar ao menu principal...")
+		scanner.Scan()
+		return
+	}
+
+	fmt.Printf("\n=== Snapshots da conta '%s' (ID: %d) ===\n", account.Name, accountID)
+	for i, row := range rows {
+		preview := row.Message
+		if len(preview) > 80 {
+			preview = preview[:80] + "..."
+		}
+		fmt.Printf("%d. [%s] %s | %s | %s\n", i+1, row.MessageType, row.Symbol, row.UpdatedAt, preview)
+	}
+	fmt.Println("0. Voltar ao menu principal")
+
+	fmt.Print("\nDigite o número da linha para excluir (ou 0 para voltar): ")
+	scanner.Scan()
+	var index int
+	if _, err := fmt.Sscanf(strings.TrimSpace(scanner.Text()), "%d", &index); err != nil {
+		fmt.Println("Número inválido!")
+		fmt.Println("\nPressione Enter para voltar ao menu principal...")
+		scanner.Scan()
+		return
+	}
+	if index == 0 {
+		return
+	}
+	if index < 1 || index > len(rows) {
+		fmt.Println("Número inválido!")
+		fmt.Println("\nPressione Enter para voltar ao menu principal...")
+		scanner.Scan()
+		return
+	}
+
+	selected := rows[index-1]
+	fmt.Printf("\nExcluir snapshot [%s] %s? (s/n): ", selected.MessageType, selected.Symbol)
+	scanner.Scan()
+	if strings.ToLower(strings.TrimSpace(scanner.Text())) != "s" {
+		fmt.Println("Operação cancelada.")
+		fmt.Println("\nPressione Enter para voltar ao menu principal...")
+		scanner.Scan()
+		return
+	}
+
+	if err := db.DeleteLastMessageSnapshot(accountID, selected.MessageType, selected.Symbol); err != nil {
+		fmt.Printf("Erro ao excluir snapshot: %v\n", err)
+	} else {
+		fmt.Println("Snapshot excluído com sucesso!")
+	}
+	fmt.Println("\nPressione Enter para voltar ao menu principal...")
+	scanner.Scan()
 }
 

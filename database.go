@@ -237,6 +237,44 @@ func (d *Database) GetPositionSnapshotsByTypes(accountID int64, messageTypes []s
 	return result, rows.Err()
 }
 
+// LastMessageSnapshotRow representa uma linha completa de snapshot para administração.
+type LastMessageSnapshotRow struct {
+	MessageType string
+	Symbol      string
+	Message     string
+	UpdatedAt   string
+}
+
+// ListLastMessageSnapshots retorna todos os snapshots de uma conta.
+func (d *Database) ListLastMessageSnapshots(accountID int64) ([]LastMessageSnapshotRow, error) {
+	rows, err := d.db.Query(
+		`SELECT message_type, symbol, message, updated_at FROM last_message_snapshots WHERE account_id = ? ORDER BY message_type, symbol`,
+		accountID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []LastMessageSnapshotRow
+	for rows.Next() {
+		var r LastMessageSnapshotRow
+		if err := rows.Scan(&r.MessageType, &r.Symbol, &r.Message, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		result = append(result, r)
+	}
+	return result, rows.Err()
+}
+
+// DeleteLastMessageSnapshot remove um snapshot específico da conta.
+func (d *Database) DeleteLastMessageSnapshot(accountID int64, messageType, symbol string) error {
+	_, err := d.db.Exec(
+		`DELETE FROM last_message_snapshots WHERE account_id = ? AND message_type = ? AND symbol = ?`,
+		accountID, messageType, symbol,
+	)
+	return err
+}
+
 // addColumnIfNotExists verifica se uma coluna existe na tabela e a adiciona se não existir
 func (d *Database) addColumnIfNotExists(tableName, columnName, columnDefinition string) error {
 	// Verificar se a coluna já existe usando PRAGMA table_info

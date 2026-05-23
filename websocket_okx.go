@@ -692,7 +692,7 @@ func (wsm *WebSocketManager) processOKXPositions(wsConn *WebSocketConnection, da
 		}
 		instId, _ := obj["instId"].(string)
 		pos, _ := obj["pos"].(string)
-		if pos == "" || pos == "0" {
+		if pos == "" {
 			continue
 		}
 		posSide, _ := obj["posSide"].(string)
